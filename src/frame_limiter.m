@@ -45,18 +45,7 @@ static mach_timebase_info_data_t g_tb;
 static IMP g_orig_next_drawable = NULL;
 static id  g_activity = nil;   // App Nap assertion so paced sleeps aren't throttled
 
-// ---- render-thread-only state (one render thread assumed) ----
-static uint64_t g_next_deadline   = 0;  // mach units
-static uint64_t g_fps_win_start   = 0;
-static unsigned g_fps_win_count   = 0;
-
-// ---- primary-layer selection (pace only the largest layer; pass overlays through) ----
-static void   *g_primary_layer = NULL;
-static double  g_primary_area  = 0.0;
-static int     g_vsync_original = -1;   // captured displaySyncEnabled of the primary layer
-static int     g_vsync_applied  = -1;
-static int     g_logged_first   = 0;
-static unsigned g_dbg_frames    = 0;
+static char g_log_file_path[1024] = {0};
 
 static void log_line(const char *fmt, ...) {
     char buf[512];
@@ -65,10 +54,15 @@ static void log_line(const char *fmt, ...) {
     va_end(ap);
     fprintf(stderr, "[framelimiter] %s\n", buf);
     fflush(stderr);
-    // Also to os_log, so it's visible when the host is launched by Steam (which
-    // discards stderr). Watch with:
-    //   log stream --style compact --predicate 'eventMessage CONTAINS "framelimiter"'
     os_log(OS_LOG_DEFAULT, "[framelimiter] %{public}s", buf);
+
+    if (g_log_file_path[0] != '\0') {
+        FILE *f = fopen(g_log_file_path, "a");
+        if (f) {
+            fprintf(f, "[framelimiter] %s\n", buf);
+            fclose(f);
+        }
+    }
 }
 
 static inline uint64_t ns_to_mach(uint64_t ns) {
@@ -78,98 +72,253 @@ static inline uint64_t mach_to_ns(uint64_t m) {
     return m * (uint64_t)g_tb.numer / (uint64_t)g_tb.denom;
 }
 
-// Force displaySyncEnabled per the adaptive rule, only when it needs to change.
-static void apply_vsync(CAMetalLayer *layer, int target) {
-    if (g_vsync_original < 0)
-        g_vsync_original = layer.displaySyncEnabled ? 1 : 0;
+// ---- Thread-safe frame rate pacer ----
+static pthread_mutex_t g_pace_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_next_deadline = 0;  // mach units
 
-    int refresh = atomic_load_explicit(&g_refresh, memory_order_relaxed);
-    int desired = (target > refresh) ? 0 /* off, allow >refresh */
-                                     : g_vsync_original /* restore */;
-    if (desired == g_vsync_applied) return;
-
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    layer.displaySyncEnabled = desired ? YES : NO;
-    [CATransaction commit];
-    g_vsync_applied = desired;
-    log_line("displaySyncEnabled=%d (target=%d refresh=%d original=%d)",
-             desired, target, refresh, g_vsync_original);
-}
-
-// Sleep so consecutive paced calls are >= one period apart. Deadlines accumulate
-// (no per-frame drift) but never build up debt after a stall.
 static void pace(int fps) {
     uint64_t period = ns_to_mach(1000000000ull / (uint64_t)fps);
     uint64_t now = mach_absolute_time();
+    uint64_t slot = 0;
 
-    if (g_next_deadline == 0) {            // first paced frame: render immediately, seed schedule
+    pthread_mutex_lock(&g_pace_mutex);
+    if (g_next_deadline == 0) {
         g_next_deadline = now + period;
-        return;
+        slot = now;
+    } else {
+        if (g_next_deadline < now) {
+            g_next_deadline = now;
+        }
+        slot = g_next_deadline;
+        g_next_deadline += period;
     }
-    if (g_next_deadline > now) {
-        mach_wait_until(g_next_deadline);  // no busy-wait: power is the whole point
-        now = mach_absolute_time();
-    }
-    uint64_t next = g_next_deadline + period;
-    if (next < now) next = now + period;   // resync after a long stall
-    g_next_deadline = next;
-}
+    pthread_mutex_unlock(&g_pace_mutex);
 
-static void fps_tick(void) {
-    if (!g_log) return;
-    uint64_t now = mach_absolute_time();
-    if (g_fps_win_start == 0) { g_fps_win_start = now; g_fps_win_count = 0; return; }
-    g_fps_win_count++;
-    uint64_t elapsed_ns = mach_to_ns(now - g_fps_win_start);
-    if (elapsed_ns >= 1000000000ull) {
-        double fps = (double)g_fps_win_count * 1e9 / (double)elapsed_ns;
-        log_line("paced fps=%.1f target=%d",
-                 fps, atomic_load_explicit(&g_target_fps, memory_order_relaxed));
-        g_fps_win_start = now;
-        g_fps_win_count = 0;
+    if (slot > now) {
+        mach_wait_until(slot);
     }
 }
 
-// The swizzled -[CAMetalLayer nextDrawable].
+// ---- Census & primary-layer selection ----
+#define MAX_CENSUS_ENTRIES 32
+struct CensusEntry {
+    void *layer;
+    uint64_t thread_id;
+    double width;
+    double height;
+    uint32_t call_count;
+    int original_vsync; // -1 if not set, 0 or 1
+    int applied_vsync;  // -1 if not set, 0 or 1
+    int qos_set;
+};
+
+static struct CensusEntry g_census[MAX_CENSUS_ENTRIES];
+static int g_census_count = 0;
+static pthread_mutex_t g_census_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t g_last_census_time = 0;
+static void *g_primary_layer = NULL;
+static unsigned g_dbg_frames = 0;
+
+struct UniqueLayer {
+    void *layer;
+    uint32_t total_calls;
+    double width;
+    double height;
+};
+
 static id hooked_next_drawable(id self, SEL _cmd) {
     CAMetalLayer *layer = (CAMetalLayer *)self;
+    uint64_t tid = 0;
+    pthread_threadid_np(pthread_self(), &tid);
 
     CGSize sz = layer.drawableSize;
-    double area = (double)sz.width * (double)sz.height;
+    void *layer_ptr = (void *)layer;
 
-    // Track the largest layer as "primary"; only it is paced.
-    if (g_primary_layer == NULL || area > g_primary_area) {
-        if (g_primary_layer != (void *)layer)
-            log_line("primary layer=%p size=%.0fx%.0f drawables=%ld",
-                     (void *)layer, (double)sz.width, (double)sz.height,
-                     (long)layer.maximumDrawableCount);
-        g_primary_layer = (void *)layer;
-        g_primary_area = area;
+    int orig_vsync = -1;
+    int appl_vsync = -1;
+    int need_qos = 0;
+
+    pthread_mutex_lock(&g_census_mutex);
+
+    struct CensusEntry *entry = NULL;
+    BOOL seen_layer = NO;
+    BOOL seen_thread = NO;
+
+    for (int i = 0; i < g_census_count; i++) {
+        if (g_census[i].layer == layer_ptr) {
+            seen_layer = YES;
+            if (g_census[i].thread_id == tid) {
+                entry = &g_census[i];
+            }
+        }
+        if (g_census[i].thread_id == tid) {
+            seen_thread = YES;
+        }
     }
 
-    if (g_primary_layer == (void *)layer) {
-        if (!g_logged_first) {
-            g_logged_first = 1;
-            if (g_qos) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-            log_line("first frame: displaySyncEnabled=%d maximumDrawableCount=%ld size=%.0fx%.0f",
-                     layer.displaySyncEnabled ? 1 : 0,
-                     (long)layer.maximumDrawableCount,
-                     (double)sz.width, (double)sz.height);
+    if (!seen_layer) {
+        log_line("new layer observed: %p size=%.0fx%.0f drawables=%ld",
+                 layer_ptr, (double)sz.width, (double)sz.height,
+                 (long)layer.maximumDrawableCount);
+    }
+    if (!seen_thread) {
+        log_line("new calling thread observed: %llu", tid);
+    }
+
+    if (entry) {
+        entry->call_count++;
+    } else {
+        if (g_census_count < MAX_CENSUS_ENTRIES) {
+            entry = &g_census[g_census_count++];
+            entry->layer = layer_ptr;
+            entry->thread_id = tid;
+            entry->width = sz.width;
+            entry->height = sz.height;
+            entry->call_count = 1;
+            entry->original_vsync = -1;
+            entry->applied_vsync = -1;
+            entry->qos_set = 0;
         }
-        int target = atomic_load_explicit(&g_target_fps, memory_order_relaxed);
-        apply_vsync(layer, target);
+    }
+
+    if (entry) {
+        if (!entry->qos_set) {
+            entry->qos_set = 1;
+            need_qos = 1;
+        }
+        orig_vsync = entry->original_vsync;
+        appl_vsync = entry->applied_vsync;
+    }
+
+    if (g_primary_layer == NULL) {
+        g_primary_layer = layer_ptr;
+    }
+
+    uint64_t now = mach_absolute_time();
+    if (g_last_census_time == 0) {
+        g_last_census_time = now;
+    }
+    uint64_t elapsed_ns = mach_to_ns(now - g_last_census_time);
+    if (elapsed_ns >= 1000000000ull) {
+        struct UniqueLayer unique_layers[MAX_CENSUS_ENTRIES];
+        int unique_count = 0;
+
+        for (int i = 0; i < g_census_count; i++) {
+            void *l = g_census[i].layer;
+            int found_idx = -1;
+            for (int j = 0; j < unique_count; j++) {
+                if (unique_layers[j].layer == l) {
+                    found_idx = j;
+                    break;
+                }
+            }
+            if (found_idx >= 0) {
+                unique_layers[found_idx].total_calls += g_census[i].call_count;
+            } else {
+                unique_layers[unique_count++] = (struct UniqueLayer){
+                    l, g_census[i].call_count, g_census[i].width, g_census[i].height
+                };
+            }
+        }
+
+        void *best_layer = NULL;
+        uint32_t max_calls = 0;
+        for (int i = 0; i < unique_count; i++) {
+            if (unique_layers[i].total_calls > max_calls) {
+                max_calls = unique_layers[i].total_calls;
+                best_layer = unique_layers[i].layer;
+            }
+        }
+
+        if (best_layer != NULL) {
+            g_primary_layer = best_layer;
+        }
+
+        if (g_log) {
+            char report[2048];
+            int offset = snprintf(report, sizeof(report), "census: target=%d primary=%p (fps=%.1f) layers=[",
+                                 atomic_load_explicit(&g_target_fps, memory_order_relaxed),
+                                 g_primary_layer,
+                                 (double)max_calls * 1e9 / (double)elapsed_ns);
+
+            for (int i = 0; i < g_census_count; i++) {
+                if (offset < (int)sizeof(report) - 100) {
+                    offset += snprintf(report + offset, sizeof(report) - offset,
+                                       "%p(%.0fx%.0f, calls=%u, tid=%llu)%s",
+                                       g_census[i].layer,
+                                       g_census[i].width, g_census[i].height,
+                                       g_census[i].call_count,
+                                       g_census[i].thread_id,
+                                       (i == g_census_count - 1) ? "" : ", ");
+                }
+            }
+            snprintf(report + offset, sizeof(report) - offset, "]");
+            log_line("%s", report);
+        }
+
+        for (int i = 0; i < g_census_count; i++) {
+            g_census[i].call_count = 0;
+        }
+        g_last_census_time = now;
+    }
+
+    pthread_mutex_unlock(&g_census_mutex);
+
+    if (need_qos && g_qos) {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        log_line("set QoS User Interactive for thread %llu", tid);
+    }
+
+    if (orig_vsync < 0) {
+        orig_vsync = layer.displaySyncEnabled ? 1 : 0;
+        pthread_mutex_lock(&g_census_mutex);
+        for (int i = 0; i < g_census_count; i++) {
+            if (g_census[i].layer == layer_ptr) {
+                g_census[i].original_vsync = orig_vsync;
+            }
+        }
+        pthread_mutex_unlock(&g_census_mutex);
+    }
+
+    int target = atomic_load_explicit(&g_target_fps, memory_order_relaxed);
+    int refresh = atomic_load_explicit(&g_refresh, memory_order_relaxed);
+    int desired = (target > refresh) ? 0 : orig_vsync;
+    if (desired != appl_vsync) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        layer.displaySyncEnabled = desired ? YES : NO;
+        [CATransaction commit];
+
+        pthread_mutex_lock(&g_census_mutex);
+        for (int i = 0; i < g_census_count; i++) {
+            if (g_census[i].layer == layer_ptr) {
+                g_census[i].applied_vsync = desired;
+            }
+        }
+        pthread_mutex_unlock(&g_census_mutex);
+
+        log_line("displaySyncEnabled=%d (target=%d refresh=%d original=%d layer=%p)",
+                 desired, target, refresh, orig_vsync, layer_ptr);
+    }
+
+    if (g_primary_layer == layer_ptr) {
         uint64_t t0 = mach_absolute_time();
         if (target > 0) pace(target);
         uint64_t t1 = mach_absolute_time();
+
         id dr = ((id (*)(id, SEL))g_orig_next_drawable)(self, _cmd);
+
         uint64_t t2 = mach_absolute_time();
-        if (g_log >= 2 && g_dbg_frames < 12) {
-            g_dbg_frames++;
-            log_line("frame %u: pace=%.1fms orig=%.1fms",
-                     g_dbg_frames, mach_to_ns(t1 - t0) / 1e6, mach_to_ns(t2 - t1) / 1e6);
+        if (g_log >= 2) {
+            pthread_mutex_lock(&g_census_mutex);
+            unsigned dbg = g_dbg_frames++;
+            pthread_mutex_unlock(&g_census_mutex);
+            if (dbg < 12) {
+                log_line("frame %u: pace=%.1fms orig=%.1fms",
+                         dbg, mach_to_ns(t1 - t0) / 1e6, mach_to_ns(t2 - t1) / 1e6);
+            }
         }
-        fps_tick();
         return dr;
     }
 
@@ -212,6 +361,10 @@ static void *watcher_main(void *arg) {
 
 __attribute__((constructor))
 static void framelimiter_init(void) {
+    const char *lf = getenv("FRAME_LIMIT_LOGFILE");
+    if (lf) {
+        strlcpy(g_log_file_path, lf, sizeof g_log_file_path);
+    }
     const char *fps = getenv("FRAME_LIMIT_FPS");
     if (!fps || atoi(fps) <= 0) return;   // clean no-op when unset/zero
     int target = atoi(fps);

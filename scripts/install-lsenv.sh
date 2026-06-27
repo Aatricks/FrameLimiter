@@ -38,36 +38,73 @@ case "$MODE" in
   install)
     [ -f "$DYLIB" ] || { echo "dylib missing — run 'make build' first: $DYLIB"; exit 1; }
     mkdir -p "$STATE"
-    # Keep a pristine backup once; start each install from it so LSEnvironment is clean.
+    # Keep a pristine backup once; start each install from it so Info.plist is clean
     if [ -f "$BACKUP" ]; then cp -p "$BACKUP" "$PLIST"; else cp -p "$PLIST" "$BACKUP"; fi
+    
+    # Remove any old LSEnvironment entry
     "$PB" -c "Delete :LSEnvironment" "$PLIST" 2>/dev/null || true
-    "$PB" -c "Add :LSEnvironment dict" "$PLIST"
-    "$PB" -c "Add :LSEnvironment:DYLD_INSERT_LIBRARIES string $DYLIB" "$PLIST"
-    "$PB" -c "Add :LSEnvironment:FRAME_LIMIT_FPS string $FPS" "$PLIST"
-    "$PB" -c "Add :LSEnvironment:FRAME_LIMIT_FILE string $HOME/.framelimiter.fps" "$PLIST"
-    "$PB" -c "Add :LSEnvironment:MTL_HUD_ENABLED string 1" "$PLIST"
+
+    EXE_NAME=$("$PB" -c "Print :CFBundleExecutable" "$PLIST")
+    EXE_PATH="$APP/Contents/MacOS/$EXE_NAME"
+    REAL_PATH="${EXE_PATH}.real"
+
+    # Swap original executable with real path if not already swapped
+    if [ ! -f "$REAL_PATH" ]; then
+      mv "$EXE_PATH" "$REAL_PATH"
+    fi
+
+    # Compile the wrapper C binary
+    clang -O2 -Wall -arch "$(uname -m)" \
+      -DDYLIB_PATH="\"$DYLIB\"" \
+      -DDEFAULT_FPS="\"$FPS\"" \
+      -o "$EXE_PATH" "$DIR/src/wrapper.c"
+
+    # Replicate entitlements to the wrapper binary
+    ENT="/tmp/${EXE_NAME}.entitlements"
+    codesign -d --entitlements - --xml "$REAL_PATH" > "$ENT" 2>/dev/null || true
+    if [ -f "$ENT" ] && [ -s "$ENT" ]; then
+      codesign --force --sign - --entitlements "$ENT" "$EXE_PATH"
+    else
+      codesign --force --sign - "$EXE_PATH"
+    fi
+    rm -f "$ENT"
+
     resign
     "$LSREG" -f "$APP" 2>/dev/null || true
-    # Verify the main executable + Info.plist seal (what AMFI gates launch on). We ignore
-    # nested resource seals: some games (e.g. Hades II's Backtrace.framework) ship with
-    # loose nested signatures that fail a recursive verify but launch fine.
+
     if codesign --verify --ignore-resources "$APP" 2>/dev/null; then
-      echo "signature OK (main executable + Info.plist sealed)"
+      echo "signature OK (wrapper + Info.plist sealed)"
     else
       echo "WARNING: main signature failed to verify"; exit 1
     fi
-    echo "installed: LSEnvironment injected (target ${FPS} fps). Clear Steam launch options; launch normally."
+    echo "installed: wrapper binary compiled (target ${FPS} fps). Launch normally from Steam."
     ;;
   uninstall)
-    if [ -f "$BACKUP" ]; then
-      cp -p "$BACKUP" "$PLIST"; rm -f "$BACKUP"; resign; "$LSREG" -f "$APP" 2>/dev/null || true
-      echo "restored original Info.plist and signature"
-    else
-      "$PB" -c "Delete :LSEnvironment" "$PLIST" 2>/dev/null && { resign; "$LSREG" -f "$APP" 2>/dev/null || true; echo "removed LSEnvironment"; } || echo "not installed"
+    EXE_NAME=$("$PB" -c "Print :CFBundleExecutable" "$PLIST")
+    EXE_PATH="$APP/Contents/MacOS/$EXE_NAME"
+    REAL_PATH="${EXE_PATH}.real"
+
+    if [ -f "$REAL_PATH" ]; then
+      rm -f "$EXE_PATH"
+      mv "$REAL_PATH" "$EXE_PATH"
+      echo "restored original executable"
     fi
+    if [ -f "$BACKUP" ]; then
+      cp -p "$BACKUP" "$PLIST"; rm -f "$BACKUP"
+      echo "restored original Info.plist"
+    fi
+    resign
+    "$LSREG" -f "$APP" 2>/dev/null || true
     ;;
   status)
-    if "$PB" -c "Print :LSEnvironment" "$PLIST" 2>/dev/null; then echo "(LSEnvironment present)"; else echo "not installed"; fi
+    EXE_NAME=$("$PB" -c "Print :CFBundleExecutable" "$PLIST")
+    EXE_PATH="$APP/Contents/MacOS/$EXE_NAME"
+    REAL_PATH="${EXE_PATH}.real"
+    if [ -f "$REAL_PATH" ]; then
+      echo "(wrapper binary present)"
+    else
+      echo "not installed"
+    fi
     codesign -dv "$APP" 2>&1 | grep -E 'Signature|flags' || true
     ;;
   *) echo "unknown mode: $MODE"; exit 2;;

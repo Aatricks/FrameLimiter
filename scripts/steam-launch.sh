@@ -15,6 +15,8 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"
 export DYLD_INSERT_LIBRARIES="${DYLD_INSERT_LIBRARIES:-$DIR/build/frame_limiter.dylib}"
 : "${FRAME_LIMIT_FPS:=80}";                  export FRAME_LIMIT_FPS
 : "${FRAME_LIMIT_FILE:=$HOME/.framelimiter.fps}"; export FRAME_LIMIT_FILE
+: "${FRAME_LIMIT_LOGFILE:=$HOME/.framelimiter.log}"; export FRAME_LIMIT_LOGFILE
+: "${FRAME_LIMIT_LOG:=1}";                   export FRAME_LIMIT_LOG
 : "${MTL_HUD_ENABLED:=1}";                   export MTL_HUD_ENABLED
 
 # Live retuning while the game runs:   echo 30 > ~/.framelimiter.fps
