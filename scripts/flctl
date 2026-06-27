@@ -1,0 +1,31 @@
+#!/bin/bash
+# flctl — control a running frame_limiter via its control file (live, no restart).
+#
+#   flctl            show current target
+#   flctl 30         cap to 30 fps
+#   flctl off        disable the limiter (game free-runs again)
+#   flctl on         re-enable at the last cap
+#   flctl toggle     flip between off and the last cap
+#   flctl status     show current target and file
+#
+# The cap (or 0/off) is written to FRAME_LIMIT_FILE, which the injected dylib watches.
+# Bind any of these to a system hotkey with Hammerspoon, Karabiner, Shortcuts, etc.
+set -euo pipefail
+
+FILE="${FRAME_LIMIT_FILE:-$HOME/.framelimiter.fps}"
+LAST="$FILE.last"
+DEFAULT="${FRAME_LIMIT_DEFAULT:-80}"
+
+cur()  { cat "$FILE" 2>/dev/null || echo 0; }
+last() { cat "$LAST" 2>/dev/null || echo "$DEFAULT"; }
+set_fps() { echo "$1" > "$FILE"; [ "$1" != "0" ] && echo "$1" > "$LAST" || true; }
+
+case "${1:-status}" in
+  status|"")          echo "target: $(cur)  (file: $FILE)";;
+  off|disable|0)      set_fps 0;          echo "limiter off (free-run)";;
+  on|enable)          set_fps "$(last)";  echo "limiter on -> $(last) fps";;
+  toggle)             if [ "$(cur)" = "0" ]; then set_fps "$(last)"; echo "on -> $(last) fps";
+                      else set_fps 0; echo "off"; fi;;
+  *[!0-9]*)           echo "usage: flctl <fps>|off|on|toggle|status"; exit 2;;
+  *)                  set_fps "$1";       echo "limiter -> $1 fps";;
+esac

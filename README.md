@@ -85,17 +85,38 @@ DYLD_INSERT_LIBRARIES=/abs/path/build/frame_limiter.dylib FRAME_LIMIT_FPS=80 \
   "/path/to/Game.app/Contents/MacOS/Game"
 ```
 
-## Live tuning
+## Runtime control (enable / disable / change the cap)
 
-Change the cap while the game is running, no restart (the Steam wrapper points
+The cap is held in a control file the injected dylib watches, so you change it while the
+game runs — no restart. `scripts/flctl` is a thin front-end (the Steam wrapper points
 `FRAME_LIMIT_FILE` at `~/.framelimiter.fps`):
 
 ```sh
-echo 30 > ~/.framelimiter.fps     # path set by FRAME_LIMIT_FILE (default $TMPDIR/framelimiter.fps)
+scripts/flctl 30        # cap to 30 fps
+scripts/flctl off       # disable — the game free-runs again (cap = 0)
+scripts/flctl on        # re-enable at the last cap
+scripts/flctl toggle    # flip off <-> last cap
+scripts/flctl status    # show the current target
 ```
 
-Or, with `FRAME_LIMIT_SIGNALS=1`, send `SIGUSR1` (step down) / `SIGUSR2` (step up) to the
-game process to nudge the target by 5 fps.
+Equivalently, just write the file: `echo 30 > ~/.framelimiter.fps` (and `echo 0` to
+disable). With `FRAME_LIMIT_SIGNALS=1`, `SIGUSR1`/`SIGUSR2` sent to the game step the
+target by 5 fps.
+
+### Hotkeys
+
+There's no in-process hotkey (an injected dylib can't reliably grab global keys without
+accessibility permissions, and games consume input themselves). Instead bind a system
+hotkey to `flctl` with any hotkey tool. Example with [Hammerspoon](https://www.hammerspoon.org):
+
+```lua
+local fl = "/Users/aatricks/Documents/Dev/FrameLimiter/scripts/flctl"
+hs.hotkey.bind({"cmd","alt"}, "L", function() hs.execute(fl.." toggle", true) end)  -- on/off
+hs.hotkey.bind({"cmd","alt"}, "[", function() hs.execute(fl.." 30", true) end)
+hs.hotkey.bind({"cmd","alt"}, "]", function() hs.execute(fl.." 80", true) end)
+```
+
+(Karabiner-Elements, BetterTouchTool, or a macOS Shortcut running a shell line work too.)
 
 ## Configuration
 
@@ -146,6 +167,47 @@ codesign -d --entitlements ent.plist "$BIN"   # then add, in ent.plist:
 codesign -f -s - --options runtime --entitlements ent.plist "$APP"
 xattr -dr com.apple.quarantine "$APP"
 ```
+
+## Which games work
+
+It works with **native macOS games that render through Metal** — i.e. that present via a
+`CAMetalLayer`. That's essentially every modern native Mac game, whether it uses Metal
+directly, MetalKit/`MTKView`, or SDL2 / MoltenVK (MoltenVK also presents through a
+`CAMetalLayer`). Install per game by running `install-bundle-wrapper.sh` on that game's
+`.app`.
+
+It does **not** apply to:
+
+- **Non-native games** run through Wine / CrossOver / Whisky / Game Porting Toolkit — those
+  are Windows binaries under translation, with a different present path.
+- **Hardened + notarized** binaries, until re-signed (run `check-target.sh`; it tells you).
+  Many Steam games — like Hades II — ship ad-hoc signed and need no re-sign.
+- **Anti-cheat** titles (EAC/BattlEye) — injection will be flagged. Single-player only.
+- **OpenGL-only** games (rare on current macOS) — no `CAMetalLayer` to hook.
+
+And remember it only caps *downward*: a game already running at or below your target, or one
+that hard-caps its own frame rate, won't change.
+
+## Showing framerate and power
+
+Frame rate: set `MTL_HUD_ENABLED=1` (the Steam wrapper does this) for Apple's Metal HUD, or
+watch the limiter's own `paced fps=` lines via `log stream … "framelimiter"`. Apple's HUD is
+**not customizable and has no show/hide hotkey** — it's on for the run or off; it can't be
+extended to show GPU power.
+
+Power draw isn't available inside the Metal HUD, and reading it accurately is a separate
+concern from frame pacing. The simplest way to watch it next to the game is a lightweight
+monitor running alongside:
+
+- [`macmon`](https://github.com/vladkens/macmon) — a terminal Apple-Silicon power monitor
+  that reads CPU/GPU/package watts **without `sudo`**.
+- [Stats](https://github.com/exelban/stats) — a menu-bar monitor with a GPU/power readout.
+- `sudo powermetrics --samplers gpu_power -i 1000` — Apple's own sampler.
+
+Capping to 30 vs. free-running, side by side in one of those, is the clearest way to see the
+thermal/battery win. (A built-in on-screen overlay that draws fps **and** GPU watts together,
+toggled by hotkey, is a possible future addition — see the note at the end of
+[docs/DESIGN.md](docs/DESIGN.md).)
 
 ## Caveats
 
