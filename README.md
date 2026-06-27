@@ -44,22 +44,28 @@ signature. `make build` does it for you.
 
 ## Usage
 
-### Steam
+### Steam (macOS)
 
-In the game's **Properties → Launch Options**:
-
-```
-DYLD_INSERT_LIBRARIES=/abs/path/build/frame_limiter.dylib FRAME_LIMIT_FPS=80 %command%
-```
-
-Add `MTL_HUD_ENABLED=1` to see Apple's on-screen Metal HUD and confirm the cap.
-
-If the library doesn't load (no `[framelimiter] loaded …` line appears in the game's
-log), an intermediate launcher is stripping the environment. Use the wrapper instead:
+macOS Steam does **not** shell-parse launch options, so the Linux-style
+`VAR=value … %command%` form fails to launch (`failed to start process … os error 260`).
+Use the wrapper script as the launch command instead — in **Properties → Launch Options**:
 
 ```
-/abs/path/scripts/steam-launch.sh %command%
+"/abs/path/scripts/steam-launch.sh" %command%
 ```
+
+The wrapper sets `DYLD_INSERT_LIBRARIES`, `FRAME_LIMIT_FPS` (default 80),
+`FRAME_LIMIT_FILE` (`~/.framelimiter.fps`) and `MTL_HUD_ENABLED=1`, then execs the game.
+Edit the script to change the default target. The Metal HUD confirms the cap; the limiter
+also logs via `os_log`:
+
+```sh
+log stream --style compact --predicate 'eventMessage CONTAINS "framelimiter"'
+```
+
+On **Linux** Steam the env-prefix form works directly:
+`DYLD_INSERT_LIBRARIES=… FRAME_LIMIT_FPS=80 %command%` (this project targets macOS, but the
+mechanism is the same).
 
 ### Any app
 
@@ -70,10 +76,11 @@ DYLD_INSERT_LIBRARIES=/abs/path/build/frame_limiter.dylib FRAME_LIMIT_FPS=80 \
 
 ## Live tuning
 
-Change the cap while the game is running, no restart:
+Change the cap while the game is running, no restart (the Steam wrapper points
+`FRAME_LIMIT_FILE` at `~/.framelimiter.fps`):
 
 ```sh
-echo 30 > "$TMPDIR/framelimiter.fps"     # path configurable via FRAME_LIMIT_FILE
+echo 30 > ~/.framelimiter.fps     # path set by FRAME_LIMIT_FILE (default $TMPDIR/framelimiter.fps)
 ```
 
 Or, with `FRAME_LIMIT_SIGNALS=1`, send `SIGUSR1` (step down) / `SIGUSR2` (step up) to the

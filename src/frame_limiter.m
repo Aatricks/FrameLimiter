@@ -21,6 +21,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <mach/mach_time.h>
+#import <os/log.h>
 
 #include <stdatomic.h>
 #include <stdarg.h>
@@ -64,6 +65,10 @@ static void log_line(const char *fmt, ...) {
     va_end(ap);
     fprintf(stderr, "[framelimiter] %s\n", buf);
     fflush(stderr);
+    // Also to os_log, so it's visible when the host is launched by Steam (which
+    // discards stderr). Watch with:
+    //   log stream --style compact --predicate 'eventMessage CONTAINS "framelimiter"'
+    os_log(OS_LOG_DEFAULT, "[framelimiter] %{public}s", buf);
 }
 
 static inline uint64_t ns_to_mach(uint64_t ns) {
