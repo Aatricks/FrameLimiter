@@ -17,7 +17,11 @@ export DYLD_INSERT_LIBRARIES="${DYLD_INSERT_LIBRARIES:-$DIR/build/frame_limiter.
 : "${FRAME_LIMIT_FILE:=$HOME/.framelimiter.fps}"; export FRAME_LIMIT_FILE
 : "${FRAME_LIMIT_LOGFILE:=$HOME/.framelimiter.log}"; export FRAME_LIMIT_LOGFILE
 : "${FRAME_LIMIT_LOG:=1}";                   export FRAME_LIMIT_LOG
-: "${MTL_HUD_ENABLED:=1}";                   export MTL_HUD_ENABLED
+HUD_VAL=1
+if [ -f "$HOME/.framelimiter.hud" ] && [ "$(cat "$HOME/.framelimiter.hud" 2>/dev/null)" = "0" ]; then
+    HUD_VAL=0
+fi
+: "${MTL_HUD_ENABLED:=$HUD_VAL}";            export MTL_HUD_ENABLED
 
 # Live retuning while the game runs:   echo 30 > ~/.framelimiter.fps
 

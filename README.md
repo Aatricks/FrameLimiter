@@ -1,216 +1,164 @@
 # FrameLimiter
 
-A small frame-rate limiter for **native Metal games on macOS** (Apple Silicon),
-injected as a dylib via `DYLD_INSERT_LIBRARIES`. It caps a game's frame rate to a
-configurable, **live-tunable** target — independent of the game's own VSync setting —
-to trade input latency against GPU power and heat.
+A frame rate limiter for native Metal games on macOS (Apple Silicon). It injects as a dynamic library (`DYLD_INSERT_LIBRARIES`) to cap a game's frame rate to a configurable, live-tunable target, independent of VSync.
 
-It's aimed at fanless Apple Silicon laptops, where rendering far above what the panel
-can show (or above what the game needs) just wastes battery and generates heat for
-frames you never see.
+This is intended for fanless Apple Silicon laptops, where rendering frames beyond the display's refresh rate (or what the game needs) wastes battery and generates heat.
 
 ## How it works
 
-- It swizzles `-[CAMetalLayer nextDrawable]` and paces the render loop with
-  `mach_wait_until`.
-- Pacing `nextDrawable` applies **back-pressure**: the in-flight drawable pool drains
-  and the render thread stalls, so the GPU does *less real work* — it isn't merely
-  delaying display.
-- **Adaptive VSync**: if the target is above the display refresh, `displaySyncEnabled`
-  is forced off so the engine can produce frames faster than the panel refreshes (this
-  tears on a fixed-refresh panel — the accepted price of lower latency). At or below
-  refresh, the layer's original VSync setting is restored.
-- It **sleeps, never spins** — no busy-waiting, because the whole point is to save power.
+The limiter hooks `-[CAMetalLayer nextDrawable]` (the core call games use to request framebuffers) and inserts a calculated delay using `mach_wait_until` to pace the render loop. 
 
-A limiter can only cap *downward*. It cannot make a game render faster than it already
-does; an above-refresh target only has an effect if the game actually produces that many
-frames with VSync off.
+Unlike simple display presentation delays, delaying `nextDrawable` creates back-pressure in the render pipeline. This causes the game engine to stall naturally, lowering GPU utilization and saving power.
 
-## Requirements
+- **Zero busy-waiting**: It sleeps rather than spins to conserve energy.
+- **Adaptive VSync**: If the target frame rate is set above the display refresh rate, the library turns off the layer's VSync (`displaySyncEnabled`) to minimize input latency (at the cost of screen tearing). At or below the refresh rate, the game's original VSync setting is respected.
 
-- Apple Silicon Mac, current macOS.
-- A native Metal target that presents through `CAMetalLayer` — which is essentially all
-  of them, including games built on MetalKit/`MTKView` or SDL2's Metal backend.
-- Xcode Command Line Tools (`clang`) to build.
+## Building
 
-## Build
+To build the library:
 
-```sh
-make build           # -> build/frame_limiter.dylib  (ad-hoc signed)
+```bash
+make build
 ```
 
-Ad-hoc signing is mandatory: on Apple Silicon every loaded image must carry a valid
-signature. `make build` does it for you.
+This compiles:
+- `build/frame_limiter.dylib` (ad-hoc signed for Apple Silicon compatibility)
+- `build/minimal_metal_app` (a test harness)
 
 ## Usage
 
-### Steam (macOS) — Info.plist install
+### 1. Steam & Native Games (Wrapper Binary Method)
+Steam on macOS cannot pass environment variables through launch options, and using `%command%` wrapper scripts fails with an OS execution error (Valve issue #5548).
 
-macOS Steam **cannot pass environment variables through launch options**: it treats the
-first token of `%command%` as the program path, so both `VAR=value … %command%` and a
-`wrapper.sh %command%` form fail with *"failed to start process … os error 260"*
-([Valve issue #5548](https://github.com/ValveSoftware/steam-for-linux/issues/5548)).
+To get around this, the `install-lsenv.sh` script replaces the game's executable with a compiled C wrapper that sets the required environment variables before launching the real game (renamed to `Executable.real`). 
 
-The installer instead adds an `LSEnvironment` block to the game's `Info.plist` and ad-hoc
-re-signs the bundle, so LaunchServices injects the dylib when the game launches **as itself**:
+By compiling a binary wrapper and copying the original game's entitlements, macOS still recognizes the app identity, ensuring **Game Mode** and fullscreen compositor bypass optimizations remain active.
 
-```sh
-make build
-scripts/install-lsenv.sh install "/path/Game.app" 80   # cap 80 (default if omitted)
+```bash
+# Install (replaces the game executable with the C wrapper; defaults to 80 fps if FPS is omitted)
+./scripts/install-lsenv.sh install "/path/to/Game.app" 80
+
+# Uninstall (restores the original executable and plist backups)
+./scripts/install-lsenv.sh uninstall "/path/to/Game.app"
 ```
 
-Then **clear the game's Steam launch options** and launch normally; the Metal HUD (top-left)
-confirms the cap. Revert anytime — also before reporting a game bug, and after a game update,
-which restores the original `Info.plist`:
+*Note: Game updates through Steam or the App Store will overwrite the wrapper executable. You will need to re-run the install script after any game update.*
 
-```sh
-scripts/install-lsenv.sh uninstall "/path/Game.app"   # re-run install after each game update
+### 2. Standalone Games (Direct Command Line)
+For standalone apps launched outside of Steam, you can run them directly from the terminal with the environment variables pre-set:
+
+```bash
+DYLD_INSERT_LIBRARIES=/Users/aatricks/Documents/Dev/FrameLimiter/build/frame_limiter.dylib \
+FRAME_LIMIT_FPS=80 \
+"/path/to/Game.app/Contents/MacOS/Game"
 ```
 
-Why edit `Info.plist` rather than replace the executable: replacing the bundle's executable
-makes macOS stop recognizing the app, which **disables Game Mode and the fullscreen
-"direct-to-display" path** that lets a game exceed the 60 Hz compositor (the game gets stuck
-at 60). Editing `Info.plist` keeps the real executable — and the app's identity — intact.
+## Runtime Tuning
 
-> On **Linux** Steam, environment variables in launch options work directly:
-> `DYLD_INSERT_LIBRARIES=… FRAME_LIMIT_FPS=80 %command%`. `scripts/steam-launch.sh` wraps that
-> case and direct (non-Steam) launches.
+The frame rate cap can be changed instantly **on the fly** without restarting the game. However, toggling the Metal HUD requires **restarting the game**, as macOS only checks the HUD environment variable at startup.
 
-### Any app
+Use the `flctl` tool to control these settings (saved to `~/.framelimiter.fps` and `~/.framelimiter.hud` respectively):
 
-```sh
-DYLD_INSERT_LIBRARIES=/abs/path/build/frame_limiter.dylib FRAME_LIMIT_FPS=80 \
-  "/path/to/Game.app/Contents/MacOS/Game"
+```bash
+./scripts/flctl 30          # Cap to 30 fps (takes effect immediately)
+./scripts/flctl off         # Disable the cap (takes effect immediately)
+./scripts/flctl on          # Restore the last active cap (takes effect immediately)
+./scripts/flctl toggle      # Toggle the cap on/off (takes effect immediately)
+./scripts/flctl hud off     # Hide the Metal HUD overlay (requires game restart)
+./scripts/flctl hud on      # Show the Metal HUD overlay (requires game restart)
+./scripts/flctl status      # Show current status (fps cap and HUD state)
 ```
 
-## Runtime control (enable / disable / change the cap)
+Or write to the files directly:
+```bash
+# Set target frame rate
+echo 30 > ~/.framelimiter.fps
 
-The cap is held in a control file the injected dylib watches, so you change it while the
-game runs — no restart. `scripts/flctl` is a thin front-end (the Steam wrapper points
-`FRAME_LIMIT_FILE` at `~/.framelimiter.fps`):
-
-```sh
-scripts/flctl 30        # cap to 30 fps
-scripts/flctl off       # disable — the game free-runs again (cap = 0)
-scripts/flctl on        # re-enable at the last cap
-scripts/flctl toggle    # flip off <-> last cap
-scripts/flctl status    # show the current target
+# Show/hide Metal HUD
+echo 0 > ~/.framelimiter.hud  # Hide
+echo 1 > ~/.framelimiter.hud  # Show
 ```
 
-Equivalently, just write the file: `echo 30 > ~/.framelimiter.fps` (and `echo 0` to
-disable). With `FRAME_LIMIT_SIGNALS=1`, `SIGUSR1`/`SIGUSR2` sent to the game step the
-target by 5 fps.
-
-### Hotkeys
-
-There's no in-process hotkey (an injected dylib can't reliably grab global keys without
-accessibility permissions, and games consume input themselves). Instead bind a system
-hotkey to `flctl` with any hotkey tool. Example with [Hammerspoon](https://www.hammerspoon.org):
+### Hotkeys via Hammerspoon
+You can bind `flctl` to system-wide shortcuts. For example, in Hammerspoon:
 
 ```lua
 local fl = "/Users/aatricks/Documents/Dev/FrameLimiter/scripts/flctl"
-hs.hotkey.bind({"cmd","alt"}, "L", function() hs.execute(fl.." toggle", true) end)  -- on/off
+hs.hotkey.bind({"cmd","alt"}, "L", function() hs.execute(fl.." toggle", true) end)
 hs.hotkey.bind({"cmd","alt"}, "[", function() hs.execute(fl.." 30", true) end)
 hs.hotkey.bind({"cmd","alt"}, "]", function() hs.execute(fl.." 80", true) end)
 ```
 
-(Karabiner-Elements, BetterTouchTool, or a macOS Shortcut running a shell line work too.)
+## Recommended Targets (60Hz Displays)
 
-## Configuration
+On fixed 60Hz displays (like most fanless MacBooks):
+- **Below 60 FPS**: Stick to integer divisors of 60 (**30, 20, or 15 fps**) to prevent judder. Frame rates like 40 or 45 will stutter because frames won't line up with the display's refresh cycles.
+- **At 60 FPS**: Matches the display refresh while saving power.
+- **Above 60 FPS (e.g. 80)**: Lowers input latency, but requires VSync to be disabled (handled automatically) which causes tearing.
 
-| Variable | Default | Meaning |
+## Environment Variables
+
+Configure behavior by setting these before launching:
+
+| Variable | Default | Description |
 |---|---|---|
-| `FRAME_LIMIT_FPS` | *(unset)* | Target fps. **Unset or `0` = no-op**: nothing is hooked. |
-| `FRAME_LIMIT_FILE` | `$TMPDIR/framelimiter.fps` | Control file watched for live retuning. |
-| `FRAME_LIMIT_REFRESH` | `60` | Display refresh (Hz) used as the adaptive-VSync threshold. Set to your panel's rate. |
-| `FRAME_LIMIT_LOG` | `0` | `1` = periodic fps logging; `2` = per-frame pace/timing. |
-| `FRAME_LIMIT_SIGNALS` | *(off)* | `1` = enable `SIGUSR1`/`SIGUSR2` stepping. Off by default so it can't clash with a game that uses those signals. |
-| `FRAME_LIMIT_QOS` | `1` | Pin the render thread to user-interactive QoS for precise pacing. `0` disables. |
-| `FRAME_LIMIT_NONAP` | `1` | Keep the host out of App Nap so paced sleeps aren't throttled. `0` disables. |
+| `FRAME_LIMIT_FPS` | *unset* | Target FPS. Unset or `0` disables the limiter. |
+| `FRAME_LIMIT_FILE` | `$TMPDIR/framelimiter.fps` | Control file to watch for runtime changes. |
+| `FRAME_LIMIT_REFRESH` | `60` | Screen refresh rate (Hz) for VSync switching. |
+| `FRAME_LIMIT_LOG` | `0` | `1` to log periodic FPS; `2` for per-frame timing details. |
+| `FRAME_LIMIT_SIGNALS` | `0` | Set `1` to enable `SIGUSR1`/`SIGUSR2` target stepping (+/- 5 fps). |
+| `FRAME_LIMIT_QOS` | `1` | Forces user-interactive QoS on the render thread. |
+| `FRAME_LIMIT_NONAP` | `1` | Disables macOS App Nap throttling for the game process. |
+| `MTL_HUD_ENABLED` | `1` | macOS native Metal HUD overlay toggle. Set to `0` to hide it. |
 
-## Choosing a target on a fixed-refresh panel
+## Code Signing & Hardened Runtime
 
-Most Apple Silicon laptops have a **60 Hz fixed** internal panel (no ProMotion/VRR). That
-shapes what targets make sense:
+If a game runs with a **Hardened Runtime** or enforces **Library Validation**, macOS will ignore `DYLD_INSERT_LIBRARIES`.
 
-- **Below refresh** — only **divisors of 60 (30 / 20 / 15)** are judder-free, because each
-  frame is shown for a whole number of refreshes. **30 fps** halves the frame count and is
-  the best cool-and-quiet point. Non-divisors (45, 40, 58…) microjudder.
-- **At refresh (60)** — the no-tearing baseline; useful to stop a game wasting power above
-  what the panel shows.
-- **Above refresh (e.g. 80)** — only meaningful with VSync off, which the limiter forces.
-  It lowers input latency (each displayed frame was rendered more recently) at the cost of
-  **tearing**. Only works if the game actually renders that fast.
-
-## Code signing — when you do and don't need to re-sign
-
-`DYLD_INSERT_LIBRARIES` is ignored only when the target has a **hardened runtime** without
-the dyld-environment entitlement, or **library validation** rejects foreign dylibs. Many
-games don't have either — they ship ad-hoc signed with library validation already disabled
-and no hardened runtime, so injection works with **no changes to the game**.
-
-Check any target:
-
-```sh
-scripts/check-target.sh "/path/to/Game.app/Contents/MacOS/Game"
+Check the game's executable:
+```bash
+./scripts/check-target.sh "/path/to/Game.app/Contents/MacOS/Game"
 ```
 
-If it reports a hardened runtime, re-sign it locally (this breaks notarization — fine for
-local use — and is reverted by game updates):
+If it has a hardened runtime, you can re-sign it locally with validation disabled:
 
-```sh
-codesign -d --entitlements ent.plist "$BIN"   # then add, in ent.plist:
-#   com.apple.security.cs.disable-library-validation
-#   com.apple.security.cs.allow-dyld-environment-variables
-codesign -f -s - --options runtime --entitlements ent.plist "$APP"
-xattr -dr com.apple.quarantine "$APP"
-```
+1. Extract current entitlements:
+   ```bash
+   codesign -d --entitlements ents.plist "/path/to/Game.app/Contents/MacOS/Game"
+   ```
+2. Add these keys to `ents.plist`:
+   ```xml
+   <key>com.apple.security.cs.disable-library-validation</key>
+   <true/>
+   <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+   <true/>
+   ```
+3. Re-sign the app:
+   ```bash
+   codesign -f -s - --options runtime --entitlements ents.plist "/path/to/Game.app"
+   xattr -dr com.apple.quarantine "/path/to/Game.app"
+   ```
 
-## Which games work
+## Compatibility
 
-It works with **native macOS games that render through Metal** — i.e. that present via a
-`CAMetalLayer`. That's essentially every modern native Mac game, whether it uses Metal
-directly, MetalKit/`MTKView`, or SDL2 / MoltenVK (MoltenVK also presents through a
-`CAMetalLayer`). Install per game by running `install-lsenv.sh` on that game's `.app`.
-
-It does **not** apply to:
-
-- **Non-native games** run through Wine / CrossOver / Whisky / Game Porting Toolkit — those
-  are Windows binaries under translation, with a different present path.
-- **Hardened + notarized** binaries, until re-signed (run `check-target.sh`; it tells you).
-  Many Steam games — like Hades II — ship ad-hoc signed and need no re-sign.
-- **Anti-cheat** titles (EAC/BattlEye) — injection will be flagged. Single-player only.
-- **OpenGL-only** games (rare on current macOS) — no `CAMetalLayer` to hook.
-
-And remember it only caps *downward*: a game already running at or below your target, or one
-that hard-caps its own frame rate, won't change.
-
-## Caveats
-
-- **Tearing** above refresh is inherent on a fixed panel without VRR.
-- **Anti-cheat**: dylib injection (and any re-signing) will trip EAC / BattlEye / VAC. Use
-  only on single-player games.
-- **External displays**: set `FRAME_LIMIT_REFRESH` to that display's refresh rate.
-- If a game presents through several `CAMetalLayer`s, only the largest ("primary") layer is
-  paced; overlays pass through untouched.
+- **Anti-Cheat**: Do not use on games with active anti-cheat (Easy Anti-Cheat, BattlEye, VAC). Dylib injection and re-signing will trigger bans.
+- **Translation Layers**: Does not support games running via Wine, CrossOver, Whisky, or GPTK.
+- **Metal Only**: Requires the game to render via `CAMetalLayer`. OpenGL games are not supported.
 
 ## Testing
 
-`minimal_metal_app/` is a tiny native-Metal harness that drives `nextDrawable` in a loop
-and logs its achieved fps, so the limiter can be exercised without a real game:
+Verify the limiter using the minimal test app:
 
-```sh
-WINDOWED=1 FRAME_LIMIT_LOG=1 ./scripts/run-minimal.sh 80   # visible window, capped to 80
-make run-minimal FPS=30                                    # headless, capped to 30
+```bash
+# Headless test capped at 30 fps
+make run-minimal FPS=30
+
+# Windowed test capped at 80 fps with logging
+WINDOWED=1 FRAME_LIMIT_LOG=1 ./scripts/run-minimal.sh 80
 ```
 
-Keep the window foreground (or verify in a real game with `MTL_HUD_ENABLED=1`) for accurate
-readings — macOS coalesces timers for backgrounded, window-less utility processes, which can
-make the headless harness's fps noisy even though the limiter is pacing correctly.
-
-See [docs/DESIGN.md](docs/DESIGN.md) for the recon, the hook-point rationale, and the risk
-analysis.
+Keep the test window active for accurate timing; macOS throttles background processes.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT

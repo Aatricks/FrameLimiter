@@ -13,19 +13,28 @@
 set -euo pipefail
 
 FILE="${FRAME_LIMIT_FILE:-$HOME/.framelimiter.fps}"
+HUD_FILE="${FRAME_LIMIT_HUD_FILE:-$HOME/.framelimiter.hud}"
 LAST="$FILE.last"
 DEFAULT="${FRAME_LIMIT_DEFAULT:-80}"
 
 cur()  { cat "$FILE" 2>/dev/null || echo 0; }
+hud_cur() { cat "$HUD_FILE" 2>/dev/null || echo 1; }
 last() { cat "$LAST" 2>/dev/null || echo "$DEFAULT"; }
 set_fps() { echo "$1" > "$FILE"; [ "$1" != "0" ] && echo "$1" > "$LAST" || true; }
+set_hud() { echo "$1" > "$HUD_FILE"; }
 
 case "${1:-status}" in
-  status|"")          echo "target: $(cur)  (file: $FILE)";;
+  status|"")          echo "target: $(cur) fps (file: $FILE)"
+                      echo "metal hud: $([ "$(hud_cur)" = "0" ] && echo "disabled" || echo "enabled") (file: $HUD_FILE)";;
   off|disable|0)      set_fps 0;          echo "limiter off (free-run)";;
   on|enable)          set_fps "$(last)";  echo "limiter on -> $(last) fps";;
   toggle)             if [ "$(cur)" = "0" ]; then set_fps "$(last)"; echo "on -> $(last) fps";
                       else set_fps 0; echo "off"; fi;;
-  *[!0-9]*)           echo "usage: flctl <fps>|off|on|toggle|status"; exit 2;;
+  hud)                case "${2:-status}" in
+                        on|enable|1)  set_hud 1; echo "hud on";;
+                        off|disable|0) set_hud 0; echo "hud off";;
+                        *)            echo "usage: flctl hud on|off"; exit 2;;
+                      esac;;
+  *[!0-9]*)           echo "usage: flctl <fps>|off|on|toggle|status|hud <on|off>"; exit 2;;
   *)                  set_fps "$1";       echo "limiter -> $1 fps";;
 esac
