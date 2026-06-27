@@ -44,28 +44,39 @@ signature. `make build` does it for you.
 
 ## Usage
 
-### Steam (macOS)
+### Steam (macOS) — bundle wrapper
 
-macOS Steam does **not** shell-parse launch options, so the Linux-style
-`VAR=value … %command%` form fails to launch (`failed to start process … os error 260`).
-Use the wrapper script as the launch command instead — in **Properties → Launch Options**:
+macOS Steam **cannot pass environment variables through launch options**: it treats the
+first token of `%command%` as the program path, so both `VAR=value … %command%` and a
+`wrapper.sh %command%` form fail with *"failed to start process … os error 260"*
+([Valve issue #5548](https://github.com/ValveSoftware/steam-for-linux/issues/5548)).
 
+The reliable method is to wrap the game's bundle executable. The installer does it for you,
+reversibly:
+
+```sh
+make build
+scripts/install-bundle-wrapper.sh install "/path/Game.app" 80   # cap 80; default if omitted
 ```
-"/abs/path/scripts/steam-launch.sh" %command%
+
+It renames `Contents/MacOS/<exe>` to `<exe>.framelimiter-orig` and drops in a small wrapper
+that sets the environment and execs the original. Then **clear the game's Steam launch
+options** and launch normally. To revert (or before reporting a game bug):
+
+```sh
+scripts/install-bundle-wrapper.sh uninstall "/path/Game.app"
 ```
 
-The wrapper sets `DYLD_INSERT_LIBRARIES`, `FRAME_LIMIT_FPS` (default 80),
-`FRAME_LIMIT_FILE` (`~/.framelimiter.fps`) and `MTL_HUD_ENABLED=1`, then execs the game.
-Edit the script to change the default target. The Metal HUD confirms the cap; the limiter
-also logs via `os_log`:
+A game update re-downloads the original executable and removes the wrapper — just re-run
+`install` afterwards. The Metal HUD confirms the cap; the limiter also logs via `os_log`:
 
 ```sh
 log stream --style compact --predicate 'eventMessage CONTAINS "framelimiter"'
 ```
 
-On **Linux** Steam the env-prefix form works directly:
-`DYLD_INSERT_LIBRARIES=… FRAME_LIMIT_FPS=80 %command%` (this project targets macOS, but the
-mechanism is the same).
+> On **Linux** Steam, environment variables in launch options work directly:
+> `DYLD_INSERT_LIBRARIES=… FRAME_LIMIT_FPS=80 %command%`. `scripts/steam-launch.sh` is a
+> wrapper for that case and for launching outside Steam.
 
 ### Any app
 
