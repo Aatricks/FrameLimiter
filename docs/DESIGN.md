@@ -92,19 +92,3 @@ check for any target and prints a verdict.
 | Forcing VSync off destabilising engine timing | Only `displaySyncEnabled` is touched; can be left alone via configuration. |
 | Anti-cheat (EAC/BattlEye/VAC) | Single-player only; injection will be flagged in multiplayer. |
 | Hardened/notarised targets | `check-target.sh` detects them; re-sign procedure documented in the README. |
-
-## Possible future: an on-screen overlay with power draw
-
-Apple's Metal HUD shows frame rate but isn't extensible and can't show GPU power. A built-in
-overlay that draws both fps and watts (toggled by hotkey) is feasible but a meaningfully
-larger feature:
-
-- **Power** can be read in-process **without root** via the `IOReport` framework's energy
-  channels (the approach tools like `macmon` use), sampled on a background thread.
-- **Drawing** is the harder part: the overlay would have to render into the game's drawable
-  from the swizzled present (a small Metal text pass) or float a high-window-level
-  borderless `NSWindow` over the game. Both are workable but need per-game testing,
-  especially for exclusive-fullscreen titles, and risk destabilising the host.
-
-Until then, a side-car monitor (`macmon` / Stats) alongside the Metal HUD covers the same
-need without touching the game's render path.

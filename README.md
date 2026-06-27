@@ -188,27 +188,6 @@ It does **not** apply to:
 And remember it only caps *downward*: a game already running at or below your target, or one
 that hard-caps its own frame rate, won't change.
 
-## Showing framerate and power
-
-Frame rate: set `MTL_HUD_ENABLED=1` (the Steam wrapper does this) for Apple's Metal HUD, or
-watch the limiter's own `paced fps=` lines via `log stream … "framelimiter"`. Apple's HUD is
-**not customizable and has no show/hide hotkey** — it's on for the run or off; it can't be
-extended to show GPU power.
-
-Power draw isn't available inside the Metal HUD, and reading it accurately is a separate
-concern from frame pacing. The simplest way to watch it next to the game is a lightweight
-monitor running alongside:
-
-- [`macmon`](https://github.com/vladkens/macmon) — a terminal Apple-Silicon power monitor
-  that reads CPU/GPU/package watts **without `sudo`**.
-- [Stats](https://github.com/exelban/stats) — a menu-bar monitor with a GPU/power readout.
-- `sudo powermetrics --samplers gpu_power -i 1000` — Apple's own sampler.
-
-Capping to 30 vs. free-running, side by side in one of those, is the clearest way to see the
-thermal/battery win. (A built-in on-screen overlay that draws fps **and** GPU watts together,
-toggled by hotkey, is a possible future addition — see the note at the end of
-[docs/DESIGN.md](docs/DESIGN.md).)
-
 ## Caveats
 
 - **Tearing** above refresh is inherent on a fixed panel without VRR.
