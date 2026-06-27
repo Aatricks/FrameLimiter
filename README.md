@@ -67,12 +67,10 @@ which restores the original `Info.plist`:
 scripts/install-lsenv.sh uninstall "/path/Game.app"   # re-run install after each game update
 ```
 
-Why this and not an executable wrapper: replacing the bundle's executable makes macOS stop
-recognizing the app, which **disables Game Mode and the fullscreen "direct-to-display" path**
-that lets a game exceed the 60 Hz compositor (the game gets stuck at 60). Editing `Info.plist`
-keeps the real executable — and the app's identity — intact. (The pre-existing
-`scripts/install-bundle-wrapper.sh` is **deprecated** for that reason; keep it only for its
-`uninstall` if you used it earlier.)
+Why edit `Info.plist` rather than replace the executable: replacing the bundle's executable
+makes macOS stop recognizing the app, which **disables Game Mode and the fullscreen
+"direct-to-display" path** that lets a game exceed the 60 Hz compositor (the game gets stuck
+at 60). Editing `Info.plist` keeps the real executable — and the app's identity — intact.
 
 > On **Linux** Steam, environment variables in launch options work directly:
 > `DYLD_INSERT_LIBRARIES=… FRAME_LIMIT_FPS=80 %command%`. `scripts/steam-launch.sh` wraps that
@@ -173,8 +171,7 @@ xattr -dr com.apple.quarantine "$APP"
 It works with **native macOS games that render through Metal** — i.e. that present via a
 `CAMetalLayer`. That's essentially every modern native Mac game, whether it uses Metal
 directly, MetalKit/`MTKView`, or SDL2 / MoltenVK (MoltenVK also presents through a
-`CAMetalLayer`). Install per game by running `install-bundle-wrapper.sh` on that game's
-`.app`.
+`CAMetalLayer`). Install per game by running `install-lsenv.sh` on that game's `.app`.
 
 It does **not** apply to:
 
