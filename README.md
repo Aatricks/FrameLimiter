@@ -44,39 +44,39 @@ signature. `make build` does it for you.
 
 ## Usage
 
-### Steam (macOS) — bundle wrapper
+### Steam (macOS) — Info.plist install
 
 macOS Steam **cannot pass environment variables through launch options**: it treats the
 first token of `%command%` as the program path, so both `VAR=value … %command%` and a
 `wrapper.sh %command%` form fail with *"failed to start process … os error 260"*
 ([Valve issue #5548](https://github.com/ValveSoftware/steam-for-linux/issues/5548)).
 
-The reliable method is to wrap the game's bundle executable. The installer does it for you,
-reversibly:
+The installer instead adds an `LSEnvironment` block to the game's `Info.plist` and ad-hoc
+re-signs the bundle, so LaunchServices injects the dylib when the game launches **as itself**:
 
 ```sh
 make build
-scripts/install-bundle-wrapper.sh install "/path/Game.app" 80   # cap 80; default if omitted
+scripts/install-lsenv.sh install "/path/Game.app" 80   # cap 80 (default if omitted)
 ```
 
-It renames `Contents/MacOS/<exe>` to `<exe>.framelimiter-orig` and drops in a small wrapper
-that sets the environment and execs the original. Then **clear the game's Steam launch
-options** and launch normally. To revert (or before reporting a game bug):
+Then **clear the game's Steam launch options** and launch normally; the Metal HUD (top-left)
+confirms the cap. Revert anytime — also before reporting a game bug, and after a game update,
+which restores the original `Info.plist`:
 
 ```sh
-scripts/install-bundle-wrapper.sh uninstall "/path/Game.app"
+scripts/install-lsenv.sh uninstall "/path/Game.app"   # re-run install after each game update
 ```
 
-A game update re-downloads the original executable and removes the wrapper — just re-run
-`install` afterwards. The Metal HUD confirms the cap; the limiter also logs via `os_log`:
-
-```sh
-log stream --style compact --predicate 'eventMessage CONTAINS "framelimiter"'
-```
+Why this and not an executable wrapper: replacing the bundle's executable makes macOS stop
+recognizing the app, which **disables Game Mode and the fullscreen "direct-to-display" path**
+that lets a game exceed the 60 Hz compositor (the game gets stuck at 60). Editing `Info.plist`
+keeps the real executable — and the app's identity — intact. (The pre-existing
+`scripts/install-bundle-wrapper.sh` is **deprecated** for that reason; keep it only for its
+`uninstall` if you used it earlier.)
 
 > On **Linux** Steam, environment variables in launch options work directly:
-> `DYLD_INSERT_LIBRARIES=… FRAME_LIMIT_FPS=80 %command%`. `scripts/steam-launch.sh` is a
-> wrapper for that case and for launching outside Steam.
+> `DYLD_INSERT_LIBRARIES=… FRAME_LIMIT_FPS=80 %command%`. `scripts/steam-launch.sh` wraps that
+> case and direct (non-Steam) launches.
 
 ### Any app
 

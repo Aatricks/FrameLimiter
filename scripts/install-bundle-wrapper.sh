@@ -29,6 +29,9 @@ REAL="$MACOS/$EXE.framelimiter-orig"
 
 case "$MODE" in
   install)
+    echo "WARNING: this method replaces the executable and breaks macOS Game Mode and the"
+    echo "         >60 fullscreen path. Use scripts/install-lsenv.sh instead. Continuing in 3s..."
+    sleep 3
     [ -f "$DYLIB" ] || { echo "dylib missing — run 'make build' first: $DYLIB"; exit 1; }
     if [ -f "$REAL" ]; then echo "already wrapped (real binary at: $REAL)"; exit 0; fi
     file "$WRAP" | grep -q 'Mach-O' || { echo "refusing: '$WRAP' is not a Mach-O executable"; exit 1; }
