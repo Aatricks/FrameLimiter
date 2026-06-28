@@ -39,6 +39,7 @@ static atomic_int  g_target_fps = 0;   // desired cap in fps; <= 0 disables paci
 static atomic_int  g_refresh    = 60;  // assumed display refresh (Hz); see FRAME_LIMIT_REFRESH
 static int         g_log        = 0;   // periodic fps logging
 static int         g_qos        = 1;   // pin the render thread to user-interactive QoS
+static int         g_vsync      = -1;  // -1 = auto, 0 = force off, 1 = force on; see FRAME_LIMIT_VSYNC
 static char        g_ctrl_path[1024];
 
 static mach_timebase_info_data_t g_tb;
@@ -283,7 +284,14 @@ static id hooked_next_drawable(id self, SEL _cmd) {
 
     int target = atomic_load_explicit(&g_target_fps, memory_order_relaxed);
     int refresh = atomic_load_explicit(&g_refresh, memory_order_relaxed);
-    int desired = (target > refresh) ? 0 : orig_vsync;
+    int desired = orig_vsync;
+    if (g_vsync == 0) {
+        desired = 0;
+    } else if (g_vsync == 1) {
+        desired = 1;
+    } else {
+        desired = (target > refresh) ? 0 : orig_vsync;
+    }
     if (desired != appl_vsync) {
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
@@ -368,12 +376,13 @@ static void framelimiter_init(void) {
     const char *fps = getenv("FRAME_LIMIT_FPS");
     if (!fps || atoi(fps) <= 0) return;   // clean no-op when unset/zero
     int target = atoi(fps);
-
     mach_timebase_info(&g_tb);
     g_log = getenv("FRAME_LIMIT_LOG") ? atoi(getenv("FRAME_LIMIT_LOG")) : 0;
     if (getenv("FRAME_LIMIT_QOS")) g_qos = atoi(getenv("FRAME_LIMIT_QOS"));
     if (getenv("FRAME_LIMIT_REFRESH"))
         atomic_store(&g_refresh, atoi(getenv("FRAME_LIMIT_REFRESH")));
+    if (getenv("FRAME_LIMIT_VSYNC"))
+        g_vsync = atoi(getenv("FRAME_LIMIT_VSYNC"));
 
     const char *cf = getenv("FRAME_LIMIT_FILE");
     if (cf) {
@@ -392,12 +401,11 @@ static void framelimiter_init(void) {
     g_orig_next_drawable = method_getImplementation(m);
     method_setImplementation(m, (IMP)hooked_next_drawable);
 
-    // Keep the host out of App Nap so mach_wait_until isn't throttled/coalesced
-    // (a foreground game won't be napped anyway; this is a safety net). Light
-    // assertion: prevents napping without disabling system-wide power management.
+    // Keep the host out of App Nap and prevent timer coalescing so mach_wait_until
+    // isn't throttled. LatencyCritical ensures high-precision timing for pacing.
     if (!getenv("FRAME_LIMIT_NONAP") || atoi(getenv("FRAME_LIMIT_NONAP")) != 0) {
         g_activity = [[[NSProcessInfo processInfo]
-            beginActivityWithOptions:NSActivityUserInitiated
+            beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical)
                               reason:@"frame_limiter pacing"] retain];
     }
 
