@@ -99,6 +99,20 @@ case "$MODE" in
   install)
     [ -f "$DYLIB" ] || { echo "dylib missing — run 'make build' first: $DYLIB"; exit 1; }
 
+    # Refuse bundles whose executable isn't a Mach-O binary, BEFORE mutating anything.
+    # DYLD_INSERT_LIBRARIES only applies to Mach-O executables, and codesign cannot seal a
+    # renamed shell script as <exe>.real. This is the Steam launcher-shim case:
+    # CFBundleExecutable is a run.sh that just does `open steam://run/<id>`, so the game is
+    # launched by the Steam process and never inherits our injected env — there is nothing
+    # to wrap here. An already-installed wrapper is itself Mach-O, so reinstalls still pass.
+    if ! is_wrapper "$EXE_PATH" && ! file "$EXE_PATH" 2>/dev/null | grep -q 'Mach-O'; then
+      echo "refuse: $EXE_NAME is not a Mach-O binary — this looks like a Steam launcher"
+      echo "shim that hands off to Steam, so there is nothing to inject in this bundle."
+      echo "Install into the real game .app instead — e.g. the one under"
+      echo "~/Library/Application Support/Steam/steamapps/common/<game>/."
+      exit 1
+    fi
+
     MOVED_REAL=0
     WROTE_WRAPPER=0
     rollback() {

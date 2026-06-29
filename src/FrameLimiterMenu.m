@@ -208,13 +208,11 @@
     }
     
     [allGames sortUsingComparator:^NSComparisonResult(NSString *obj1, NSString *obj2) {
-        NSString *name1 = [[obj1 lastPathComponent] stringByDeletingPathExtension];
-        NSString *name2 = [[obj2 lastPathComponent] stringByDeletingPathExtension];
-        return [name1 localizedCaseInsensitiveCompare:name2];
+        return [[self displayNameForApp:obj1] localizedCaseInsensitiveCompare:[self displayNameForApp:obj2]];
     }];
-    
+
     for (NSString *appPath in allGames) {
-        NSString *name = [[appPath lastPathComponent] stringByDeletingPathExtension];
+        NSString *name = [self displayNameForApp:appPath];
         NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:name action:@selector(toggleGameInstall:) keyEquivalent:@""];
         item.target = self;
         item.representedObject = appPath;
@@ -258,6 +256,53 @@
         NSData *needle = [@"framelimiter" dataUsingEncoding:NSASCIIStringEncoding];
         return [exeData rangeOfData:needle options:0 range:NSMakeRange(0, exeData.length)].location != NSNotFound;
     }
+}
+
+// Can this bundle actually be injected? The wrapper sets DYLD_INSERT_LIBRARIES, which only
+// applies to Mach-O executables, and the installer can't seal a renamed shell script as
+// <exe>.real. A Steam launcher shim (CFBundleExecutable = run.sh doing `open steam://run/…`)
+// fails both ways: the game is launched by Steam and never inherits our env. Detect by the
+// executable's magic bytes — cheap, no subprocess — so we can refuse before corrupting it.
+- (BOOL)isInjectableBundleAt:(NSString *)appPath {
+    @autoreleasepool {
+        NSString *plistPath = [appPath stringByAppendingPathComponent:@"Contents/Info.plist"];
+        NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+        NSString *exeName = plist[@"CFBundleExecutable"];
+        if (!exeName) return NO;
+        NSString *exePath = [[appPath stringByAppendingPathComponent:@"Contents/MacOS"]
+                             stringByAppendingPathComponent:exeName];
+        NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:exePath];
+        if (!fh) return NO;
+        NSData *head = [fh readDataOfLength:4];
+        [fh closeFile];
+        if (head.length < 4) return NO;
+        uint32_t magic;
+        memcpy(&magic, head.bytes, 4);
+        // Mach-O (thin, either endianness) or FAT/universal (either endianness).
+        return magic == 0xFEEDFACE || magic == 0xFEEDFACF ||
+               magic == 0xCEFAEDFE || magic == 0xCFFAEDFE ||
+               magic == 0xCAFEBABE || magic == 0xBEBAFECA;
+    }
+}
+
+// Human-friendly label for a game bundle. The .app filename is often a generic engine
+// stub (Unity ships "mac.app", "Mac.app"), so prefer the bundle's own display/name keys;
+// fall back to the parent folder (the Steam installdir, e.g. "Kingdoms Deck") when the
+// filename is one of those stubs, and only then to the raw filename.
+- (NSString *)displayNameForApp:(NSString *)appPath {
+    NSString *plistPath = [appPath stringByAppendingPathComponent:@"Contents/Info.plist"];
+    NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+    for (NSString *key in @[@"CFBundleDisplayName", @"CFBundleName"]) {
+        NSString *v = plist[key];
+        if ([v isKindOfClass:[NSString class]] && v.length > 0) return v;
+    }
+    NSString *file = [[appPath lastPathComponent] stringByDeletingPathExtension];
+    NSArray *stubs = @[@"mac", @"game", @"launcher", @"app"];
+    if ([stubs containsObject:[file lowercaseString]]) {
+        NSString *parent = [[appPath stringByDeletingLastPathComponent] lastPathComponent];
+        if (parent.length > 0) return parent;
+    }
+    return file;
 }
 
 - (void)rescanGames:(id)sender {
@@ -309,20 +354,35 @@
                             [runningPath hasPrefix:[appPath stringByAppendingString:@"/"]])) {
             [NSApp activateIgnoringOtherApps:YES];
             NSAlert *alert = [[NSAlert alloc] init];
-            alert.messageText = [NSString stringWithFormat:@"Quit %@ first", [[appPath lastPathComponent] stringByDeletingPathExtension]];
+            alert.messageText = [NSString stringWithFormat:@"Quit %@ first", [self displayNameForApp:appPath]];
             alert.informativeText = @"The game must be closed before installing or uninstalling the frame limiter.";
             [alert runModal];
             return;
         }
     }
     
+    // Refuse to wrap a non-injectable bundle (e.g. a Steam launcher shim). Filtering
+    // discovery alone wouldn't catch manually-added shims, so gate at the click.
+    if (!isInstalled && ![self isInjectableBundleAt:appPath]) {
+        [NSApp activateIgnoringOtherApps:YES];
+        NSAlert *alert = [[NSAlert alloc] init];
+        alert.messageText = @"Can't inject into this app";
+        alert.informativeText = [NSString stringWithFormat:
+            @"“%@” isn't a Mach-O game binary — it looks like a Steam launcher that hands "
+            @"off to Steam, so there's nothing to inject here. Add the real game .app "
+            @"instead (usually under ~/Library/Application Support/Steam/steamapps/common/).",
+            [self displayNameForApp:appPath]];
+        [alert runModal];
+        return;
+    }
+
     NSString *fpsStr = [self readStringFromFile:@".framelimiter.fps"];
     if (!fpsStr || fpsStr.length == 0 || [fpsStr integerValue] == 0) {
         fpsStr = @"80";
     } else {
         fpsStr = [NSString stringWithFormat:@"%ld", (long)[fpsStr integerValue]];
     }
-    
+
     NSMutableArray *args = [NSMutableArray array];
     [args addObject:scriptPath];
     if (isInstalled) {
