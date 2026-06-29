@@ -56,7 +56,7 @@ The change is applied inside a disabled-action `CATransaction`, only when it nee
 ### Primary-layer selection
 
 If a game presents more than one `CAMetalLayer` per frame (e.g. a UI overlay), pacing each
-independently would over-throttle. The largest layer by drawable area is treated as the
+independently would over-throttle. The layer with the highest `nextDrawable` call count is treated as the
 "primary" and is the only one paced; others pass through untouched.
 
 ## Recon (the reason most Steam games need no re-signing)
@@ -76,9 +76,7 @@ Inspecting the primary test target (a native arm64 Metal game) showed none of th
 | Entitlements | `disable-library-validation`, `get-task-allow` | foreign dylibs load freely |
 | `__RESTRICT` segment | absent | DYLD env vars are not stripped |
 
-So injection works with **no modification to the game**, and game updates can't revert
-anything because the bundle is never touched. `scripts/check-target.sh` reproduces this
-check for any target and prints a verdict.
+So injection works by replacing the executable with a compiled C wrapper and copying the original game's entitlements, ensuring **Game Mode** and fullscreen compositor bypass optimizations remain active. The rest of the bundle is largely untouched. However, game updates *can* revert this by overwriting the wrapper executable, so the install script must be re-run after a game update. The install script automatically detects this and avoids clobbering the real binary. `scripts/check-target.sh` reproduces the hardened runtime check for any target and prints a verdict.
 
 ## Risks and mitigations
 
@@ -87,7 +85,7 @@ check for any target and prints a verdict.
 | Above-refresh target unreachable (engine refresh-gated) | Works only if the game free-runs >refresh with VSync off; otherwise the useful range is ≤ refresh. |
 | Tearing above refresh on a fixed panel | Inherent and accepted; adaptive VSync keeps VSync on at/below refresh. |
 | Non-divisor judder below refresh | Prefer 30/20/15; document the trade-off. |
-| Multiple layers / overlays | Pace only the largest (primary) layer. |
+| Multiple layers / overlays | Pace only the primary layer (by call count). |
 | Timer coalescing under power management | User-interactive QoS + App Nap assertion on the render thread. |
 | Forcing VSync off destabilising engine timing | Only `displaySyncEnabled` is touched; can be left alone via configuration. |
 | Anti-cheat (EAC/BattlEye/VAC) | Single-player only; injection will be flagged in multiplayer. |

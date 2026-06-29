@@ -31,9 +31,16 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <errno.h>
 #include <pthread.h>
 #include <pthread/qos.h>
 #include <sys/stat.h>
+#include <time.h>
+
+// Upper bound on any accepted fps target. A target this high already degenerates
+// to "no cap" in practice; the clamp just keeps a fat-fingered value from flowing
+// into the pacer unchecked.
+#define FL_MAX_FPS 1000
 
 // ---- configuration (atomics are written by the watcher thread / signal handlers) ----
 static atomic_int  g_target_fps = 0;   // desired cap in fps; <= 0 disables pacing
@@ -45,12 +52,14 @@ static char        g_ctrl_path[1024];
 static atomic_int  g_background  = 0;   // 1 while the app is occluded / not the active app
 static int         g_bg_fps      = 10;  // cap applied while backgrounded; <= 0 disables the whole feature
 static int         g_nap_suppression = 0; // 1 if we hold an App Nap assertion in the foreground
+static int         g_refresh_auto    = 0;  // 1 = track the display refresh (FRAME_LIMIT_REFRESH unset)
 
 static mach_timebase_info_data_t g_tb;
 static IMP g_orig_next_drawable = NULL;
 static id  g_activity = nil;   // App Nap assertion so paced sleeps aren't throttled
 
 static char g_log_file_path[1024] = {0};
+static char g_status_path[1024]   = {0};   // heartbeat file; read by flctl / the menu-bar app
 
 static void log_line(const char *fmt, ...) {
     char buf[512];
@@ -82,6 +91,7 @@ static pthread_mutex_t g_pace_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_next_deadline = 0;  // mach units
 
 static void pace(int fps) {
+    if (fps <= 0) return;   // defend the division below regardless of the call site
     uint64_t period = ns_to_mach(1000000000ull / (uint64_t)fps);
     uint64_t now = mach_absolute_time();
     uint64_t slot = 0;
@@ -102,6 +112,30 @@ static void pace(int fps) {
     if (slot > now) {
         mach_wait_until(slot);
     }
+}
+
+// ---- Status heartbeat ----
+// Written atomically (temp + rename) about once per second from the census tick.
+// A reader treats the file as "live" when its ts is within a few seconds of now;
+// a stale or absent file means no game is currently injected/capping. This is the
+// single source of truth behind `flctl status` and the menu-bar app's live display.
+static void write_status_file(double measured_fps) {
+    if (g_status_path[0] == '\0') return;
+    char tmp[1100];
+    snprintf(tmp, sizeof tmp, "%s.tmp.%d", g_status_path, (int)getpid());
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    int fg      = atomic_load_explicit(&g_target_fps, memory_order_relaxed);
+    int bg      = atomic_load_explicit(&g_background, memory_order_relaxed);
+    int refresh = atomic_load_explicit(&g_refresh, memory_order_relaxed);
+    int eff     = (g_bg_fps > 0 && bg) ? g_bg_fps : fg;
+    fprintf(f,
+            "pid=%d\ntarget=%d\nfg_target=%d\nmeasured_fps=%.1f\n"
+            "background=%d\nbg_fps=%d\nrefresh=%d\nvsync_mode=%d\nts=%ld\n",
+            (int)getpid(), eff, fg, measured_fps,
+            bg, g_bg_fps, refresh, g_vsync, (long)time(NULL));
+    fclose(f);
+    rename(tmp, g_status_path);   // atomic replace; partial readers never see a torn file
 }
 
 // ---- Census & primary-layer selection ----
@@ -143,6 +177,8 @@ static id hooked_next_drawable(id self, SEL _cmd) {
     int orig_vsync = -1;
     int appl_vsync = -1;
     int need_qos = 0;
+    int do_status = 0;          // a census tick fired this call → refresh the heartbeat
+    double st_measured = 0.0;   // measured primary-layer fps for the heartbeat
 
     pthread_mutex_lock(&g_census_mutex);
 
@@ -240,6 +276,9 @@ static id hooked_next_drawable(id self, SEL _cmd) {
             g_primary_layer = best_layer;
         }
 
+        do_status = 1;
+        st_measured = (double)max_calls * 1e9 / (double)elapsed_ns;
+
         if (g_log) {
             char report[2048];
             int offset = snprintf(report, sizeof(report), "census: target=%d primary=%p (fps=%.1f) layers=[",
@@ -262,13 +301,29 @@ static id hooked_next_drawable(id self, SEL _cmd) {
             log_line("%s", report);
         }
 
+        // Evict entries not called in the last interval (call_count == 0) so the fixed
+        // table can't be permanently exhausted by layer/thread churn (fullscreen
+        // toggles, resolution changes, window recreation). The entry for the current
+        // call has count >= 1 so it is never evicted; all pointers into g_census are
+        // read before this point, so compacting here invalidates nothing in use.
+        int w = 0;
         for (int i = 0; i < g_census_count; i++) {
-            g_census[i].call_count = 0;
+            if (g_census[i].call_count > 0) {
+                if (w != i) g_census[w] = g_census[i];
+                g_census[w].call_count = 0;
+                w++;
+            }
         }
+        int evicted = g_census_count - w;
+        g_census_count = w;
+        if (evicted > 0 && g_log)
+            log_line("census: evicted %d stale entr%s", evicted, evicted == 1 ? "y" : "ies");
         g_last_census_time = now;
     }
 
     pthread_mutex_unlock(&g_census_mutex);
+
+    if (do_status) write_status_file(st_measured);
 
     if (need_qos && g_qos) {
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -345,6 +400,7 @@ static void on_sigusr(int sig) {
     int cur = atomic_load_explicit(&g_target_fps, memory_order_relaxed);
     int nv = (sig == SIGUSR2) ? cur + step : cur - step;
     if (nv < 5) nv = 5;
+    if (nv > FL_MAX_FPS) nv = FL_MAX_FPS;
     atomic_store_explicit(&g_target_fps, nv, memory_order_relaxed);
 }
 
@@ -362,10 +418,18 @@ static void *watcher_main(void *arg) {
             if (f) {
                 int v = -1;
                 if (fscanf(f, "%d", &v) == 1 && v >= 0) {
+                    if (v > FL_MAX_FPS) v = FL_MAX_FPS;
                     atomic_store_explicit(&g_target_fps, v, memory_order_relaxed);
                     log_line("live reload target=%d", v);
                 }
                 fclose(f);
+            } else {
+                static int warned = 0;
+                if (!warned) {
+                    warned = 1;
+                    log_line("watcher: cannot open control file %s (errno=%d); live reload paused",
+                             g_ctrl_path, errno);
+                }
             }
         }
         usleep(250000);  // 250 ms
@@ -444,6 +508,45 @@ static void install_occlusion_observers(void) {
              g_bg_fps, g_obs_app_active, g_obs_win_visible);
 }
 
+// ---- Display refresh tracking ----
+// The adaptive-vsync decision (target > refresh ? off : on) needs the real panel
+// refresh. When FRAME_LIMIT_REFRESH is not pinned, detect it from the main screen and
+// re-detect on screen-parameter changes (refresh-rate switch, monitor hotplug, moving
+// the window to a 120 Hz external display). AppKit-only — no CoreGraphics dependency.
+static id g_screen_obs = nil;
+
+static int detect_refresh_hz(void) {
+    NSScreen *s = [NSScreen mainScreen];
+    // maximumFramesPerSecond reports the panel max reliably (built-in panels return 0
+    // from the CoreGraphics mode API); guard with respondsToSelector for old SDKs.
+    if (s && [s respondsToSelector:@selector(maximumFramesPerSecond)]) {
+        NSInteger m = [s maximumFramesPerSecond];
+        if (m > 0) return (int)m;
+    }
+    return 0;  // unknown — keep the current value
+}
+
+static void refresh_from_main_screen(void) {
+    if (!g_refresh_auto) return;
+    int hz = detect_refresh_hz();
+    if (hz <= 0) return;
+    int prev = atomic_load_explicit(&g_refresh, memory_order_relaxed);
+    if (hz != prev) {
+        atomic_store_explicit(&g_refresh, hz, memory_order_relaxed);
+        log_line("display refresh -> %d Hz (was %d)", hz, prev);
+    }
+}
+
+static void install_display_observer(void) {
+    refresh_from_main_screen();  // initial detection, now that AppKit is up
+    id t = [[NSNotificationCenter defaultCenter]
+        addObserverForName:NSApplicationDidChangeScreenParametersNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *n) { (void)n; refresh_from_main_screen(); }];
+    g_screen_obs = [t retain];
+}
+
 __attribute__((constructor))
 static void framelimiter_init(void) {
     const char *lf = getenv("FRAME_LIMIT_LOGFILE");
@@ -452,12 +555,27 @@ static void framelimiter_init(void) {
     }
     const char *fps = getenv("FRAME_LIMIT_FPS");
     if (!fps || atoi(fps) <= 0) return;   // clean no-op when unset/zero
+
+    // Identify the main game process. The wrapper sets FRAME_LIMIT_OWNER_PID to the
+    // game's pid before execv (the pid survives execv); children the game spawns get
+    // fresh pids. Non-main processes STILL install the swizzle below — so capping is
+    // never lost even if a target renders in a child — but skip the real per-process
+    // costs: the App Nap assertion, the watcher thread, and the observers. Unset owner
+    // (the standalone DYLD path) is treated as main, preserving the old behaviour.
+    const char *owner = getenv("FRAME_LIMIT_OWNER_PID");
+    int is_main = !(owner && *owner) || atoi(owner) == (int)getpid();
+
     int target = atoi(fps);
+    if (target > FL_MAX_FPS) target = FL_MAX_FPS;
     mach_timebase_info(&g_tb);
     g_log = getenv("FRAME_LIMIT_LOG") ? atoi(getenv("FRAME_LIMIT_LOG")) : 0;
     if (getenv("FRAME_LIMIT_QOS")) g_qos = atoi(getenv("FRAME_LIMIT_QOS"));
-    if (getenv("FRAME_LIMIT_REFRESH"))
-        atomic_store(&g_refresh, atoi(getenv("FRAME_LIMIT_REFRESH")));
+    const char *renv = getenv("FRAME_LIMIT_REFRESH");
+    if (renv) {
+        atomic_store(&g_refresh, atoi(renv));   // pinned by the user; skip auto-tracking
+    } else {
+        g_refresh_auto = 1;                     // detected from the display on the main queue
+    }
     if (getenv("FRAME_LIMIT_VSYNC"))
         g_vsync = atoi(getenv("FRAME_LIMIT_VSYNC"));
     if (getenv("FRAME_LIMIT_BG_FPS")) g_bg_fps = atoi(getenv("FRAME_LIMIT_BG_FPS"));
@@ -466,8 +584,21 @@ static void framelimiter_init(void) {
     if (cf) {
         strlcpy(g_ctrl_path, cf, sizeof g_ctrl_path);
     } else {
-        const char *t = getenv("TMPDIR");
-        snprintf(g_ctrl_path, sizeof g_ctrl_path, "%sframelimiter.fps", t ? t : "/tmp/");
+        // Default to $HOME/.framelimiter.fps to match flctl and the wrapper; the old
+        // $TMPDIR default meant a standalone-launched game watched a file flctl never
+        // wrote, so live tuning silently did nothing.
+        const char *h = getenv("HOME");
+        if (h) snprintf(g_ctrl_path, sizeof g_ctrl_path, "%s/.framelimiter.fps", h);
+        else   snprintf(g_ctrl_path, sizeof g_ctrl_path, "/tmp/.framelimiter.fps");
+    }
+
+    const char *sf = getenv("FRAME_LIMIT_STATUS_FILE");
+    if (sf) {
+        strlcpy(g_status_path, sf, sizeof g_status_path);
+    } else {
+        const char *h = getenv("HOME");
+        if (h) snprintf(g_status_path, sizeof g_status_path, "%s/.framelimiter.status", h);
+        else   snprintf(g_status_path, sizeof g_status_path, "/tmp/.framelimiter.status");
     }
     atomic_store(&g_target_fps, target);
 
@@ -481,7 +612,7 @@ static void framelimiter_init(void) {
 
     // Keep the host out of App Nap and prevent timer coalescing so mach_wait_until
     // isn't throttled. LatencyCritical ensures high-precision timing for pacing.
-    if (!getenv("FRAME_LIMIT_NONAP") || atoi(getenv("FRAME_LIMIT_NONAP")) != 0) {
+    if (is_main && (!getenv("FRAME_LIMIT_NONAP") || atoi(getenv("FRAME_LIMIT_NONAP")) != 0)) {
         g_nap_suppression = 1;
         g_activity = [[[NSProcessInfo processInfo]
             beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical)
@@ -498,17 +629,21 @@ static void framelimiter_init(void) {
         sigaction(SIGUSR2, &sa, NULL);
     }
 
-    pthread_t th;
-    if (pthread_create(&th, NULL, watcher_main, NULL) == 0)
-        pthread_detach(th);
+    // Live reload and the AppKit observers are main-process-only: a non-main process
+    // still paces (swizzle above) but at the launch target, without a watcher/observers.
+    if (is_main) {
+        pthread_t th;
+        int rc = pthread_create(&th, NULL, watcher_main, NULL);
+        if (rc == 0) pthread_detach(th);
+        else log_line("watcher thread failed to start (rc=%d); live reload disabled", rc);
 
-    if (g_bg_fps > 0) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            install_occlusion_observers();
+            if (g_refresh_auto) install_display_observer();
+            if (g_bg_fps > 0)   install_occlusion_observers();
         });
     }
 
-    log_line("loaded target=%d refresh=%d ctrl=%s log=%d signals=%s",
+    log_line("loaded target=%d refresh=%d ctrl=%s log=%d signals=%s main=%d",
              target, atomic_load(&g_refresh), g_ctrl_path, g_log,
-             getenv("FRAME_LIMIT_SIGNALS") ? "on" : "off");
+             getenv("FRAME_LIMIT_SIGNALS") ? "on" : "off", is_main);
 }

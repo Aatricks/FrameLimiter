@@ -5,7 +5,14 @@
 #include <string.h>
 #include <mach-o/dyld.h>
 
+// Detection marker: install-lsenv.sh greps the on-disk executable for this string to
+// tell whether the file is already our wrapper (vs. a real game binary, e.g. after a
+// Steam update overwrote the wrapper). `used` keeps it in the binary under -O2 even
+// though nothing references it. Bump the version suffix if the wrapper ABI changes.
+__attribute__((used)) static const char kFLWrapperMarker[] = "FRAMELIMITER_WRAPPER_v1";
+
 int main(int argc, char *argv[]) {
+    (void)argc;
     const char *home = getenv("HOME");
     char fps_file[PATH_MAX];
     char log_file[PATH_MAX];
@@ -45,6 +52,13 @@ int main(int argc, char *argv[]) {
         }
         fclose(bf);
     }
+
+    // Tag the main game process so the dylib's child-process guard can recognise it.
+    // The pid survives execv, so this equals the game's pid; children the game spawns
+    // get fresh pids and the dylib stays inert in them.
+    char owner_pid[16];
+    snprintf(owner_pid, sizeof(owner_pid), "%d", (int)getpid());
+    setenv("FRAME_LIMIT_OWNER_PID", owner_pid, 1);
 
     setenv("DYLD_INSERT_LIBRARIES", DYLIB_PATH, 1);
     setenv("FRAME_LIMIT_FPS", DEFAULT_FPS, 1);

@@ -1,20 +1,29 @@
 #!/bin/bash
 # flctl — control a running frame_limiter via its control file (live, no restart).
 #
-#   flctl            show current target
-#   flctl 30         cap to 30 fps
-#   flctl off        disable the limiter (game free-runs again)
-#   flctl on         re-enable at the last cap
-#   flctl toggle     flip between off and the last cap
-#   flctl status     show current target and file
+# Usage:
+#   flctl                  show current status (attach-aware)
+#   flctl status           show current status (attach-aware)
+#   flctl <fps>            cap to <fps> (clamps to 1000)
+#   flctl off|disable|0    disable the limiter (game free-runs again)
+#   flctl on|enable        re-enable at the last cap
+#   flctl toggle           flip between off and the last cap
+#   flctl bgfps            show current background fps cap
+#   flctl bgfps <fps>      set background fps cap (0 or off disables)
+#   flctl hud              show current HUD status
+#   flctl hud on|off       enable or disable the Metal HUD
+#   flctl -h, --help, help show this help message
 #
 # The cap (or 0/off) is written to FRAME_LIMIT_FILE, which the injected dylib watches.
 # Bind any of these to a system hotkey with Hammerspoon, Karabiner, Shortcuts, etc.
+
 set -euo pipefail
 
 FILE="${FRAME_LIMIT_FILE:-$HOME/.framelimiter.fps}"
 HUD_FILE="${FRAME_LIMIT_HUD_FILE:-$HOME/.framelimiter.hud}"
 LAST="$FILE.last"
+BGFILE="${FRAME_LIMIT_BGFPS_FILE:-$HOME/.framelimiter.bgfps}"
+STATUS_FILE="${FRAME_LIMIT_STATUS_FILE:-$HOME/.framelimiter.status}"
 DEFAULT="${FRAME_LIMIT_DEFAULT:-80}"
 
 cur()  { cat "$FILE" 2>/dev/null || echo 0; }
@@ -23,18 +32,91 @@ last() { cat "$LAST" 2>/dev/null || echo "$DEFAULT"; }
 set_fps() { echo "$1" > "$FILE"; [ "$1" != "0" ] && echo "$1" > "$LAST" || true; }
 set_hud() { echo "$1" > "$HUD_FILE"; }
 
+print_status() {
+  local status_ts=0
+  local status_pid=0
+  local status_target=0
+  local status_measured_fps=0.0
+  local status_refresh=0
+  local status_background=0
+  local status_bg_fps=0
+  local key val
+
+  if [ -f "$STATUS_FILE" ]; then
+    while IFS='=' read -r key val || [ -n "$key" ]; do
+      case "$key" in
+        ts) status_ts="${val:-0}" ;;
+        pid) status_pid="${val:-0}" ;;
+        target) status_target="${val:-0}" ;;
+        measured_fps) status_measured_fps="${val:-0.0}" ;;
+        refresh) status_refresh="${val:-0}" ;;
+        background) status_background="${val:-0}" ;;
+        bg_fps) status_bg_fps="${val:-0}" ;;
+      esac
+    done < "$STATUS_FILE"
+  fi
+
+  local now
+  now=$(date +%s)
+  if [ $((now - status_ts)) -le 3 ]; then
+    local out="live: capping ${status_measured_fps}/${status_refresh} fps (target ${status_target}, pid ${status_pid})"
+    if [ "$status_background" = "1" ]; then
+      out="$out [backgrounded -> ${status_bg_fps} fps]"
+    fi
+    echo "$out"
+  else
+    echo "live: no game injected (limiter idle)"
+  fi
+
+  echo "target: $(cur) fps (file: $FILE)"
+  echo "metal hud: $([ "$(hud_cur)" = "0" ] && echo "disabled" || echo "enabled") (file: $HUD_FILE)"
+}
+
+show_help() {
+  cat << 'EOF'
+flctl — control a running frame_limiter via its control file (live, no restart).
+
+Usage:
+  flctl                  show current status (attach-aware)
+  flctl status           show current status (attach-aware)
+  flctl <fps>            cap to <fps> (clamps to 1000)
+  flctl off|disable|0    disable the limiter (game free-runs again)
+  flctl on|enable        re-enable at the last cap
+  flctl toggle           flip between off and the last cap
+  flctl bgfps            show current background fps cap
+  flctl bgfps <fps>      set background fps cap (0 or off disables)
+  flctl hud              show current HUD status
+  flctl hud on|off       enable or disable the Metal HUD
+  flctl -h, --help, help show this help message
+EOF
+}
+
 case "${1:-status}" in
-  status|"")          echo "target: $(cur) fps (file: $FILE)"
-                      echo "metal hud: $([ "$(hud_cur)" = "0" ] && echo "disabled" || echo "enabled") (file: $HUD_FILE)";;
+  -h|--help|help)     show_help; exit 0;;
+  status|"")          print_status;;
   off|disable|0)      set_fps 0;          echo "limiter off (free-run)";;
   on|enable)          set_fps "$(last)";  echo "limiter on -> $(last) fps";;
   toggle)             if [ "$(cur)" = "0" ]; then set_fps "$(last)"; echo "on -> $(last) fps";
                       else set_fps 0; echo "off"; fi;;
-  hud)                case "${2:-status}" in
-                        on|enable|1)  set_hud 1; echo "hud on";;
-                        off|disable|0) set_hud 0; echo "hud off";;
-                        *)            echo "usage: flctl hud on|off"; exit 2;;
+  bgfps)              case "${2:-status}" in
+                        status|"")      cat "$BGFILE" 2>/dev/null || echo 10;;
+                        off|disable|0)  echo 0 > "$BGFILE"; echo "bgfps -> 0 fps (applies on next game launch)";;
+                        *[!0-9]*)       echo "usage: flctl bgfps <fps>|off"; exit 2;;
+                        *)              echo "$2" > "$BGFILE"; echo "bgfps -> $2 fps (applies on next game launch)";;
                       esac;;
-  *[!0-9]*)           echo "usage: flctl <fps>|off|on|toggle|status|hud <on|off>"; exit 2;;
-  *)                  set_fps "$1";       echo "limiter -> $1 fps";;
+  hud)                case "${2:-status}" in
+                        status|"")      [ "$(hud_cur)" = "0" ] && echo "disabled" || echo "enabled";;
+                        on|enable|1)    set_hud 1; echo "hud on (applies on next game launch)";;
+                        off|disable|0)  set_hud 0; echo "hud off (applies on next game launch)";;
+                        *)              echo "usage: flctl hud on|off"; exit 2;;
+                      esac;;
+  *[!0-9]*)           echo "usage: flctl <fps>|off|on|toggle|status|hud|bgfps|-h"; exit 2;;
+  *)                  val="$1"
+                      if [ "$val" -gt 1000 ]; then
+                        echo "notice: capping requested fps to 1000"
+                        val=1000
+                      fi
+                      set_fps "$val"
+                      echo "limiter -> $val fps"
+                      ;;
 esac
