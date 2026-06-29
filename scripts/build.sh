@@ -8,7 +8,7 @@ mkdir -p build
 
 clang -dynamiclib -arch "$ARCH" -O2 -Wall -Wextra \
     -o build/frame_limiter.dylib src/frame_limiter.m \
-    -framework Foundation -framework QuartzCore
+    -framework Foundation -framework QuartzCore -framework AppKit
 
 # Mandatory on Apple Silicon: all loaded code must carry a valid signature.
 codesign --force --sign - build/frame_limiter.dylib

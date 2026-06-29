@@ -13,6 +13,8 @@ Unlike simple display presentation delays, delaying `nextDrawable` creates back-
 - **Zero busy-waiting**: It sleeps rather than spins to conserve energy.
 - **Adaptive VSync**: If the target frame rate is set above the display refresh rate, the library turns off the layer's VSync (`displaySyncEnabled`) to minimize input latency (at the cost of screen tearing). At or below the refresh rate, the game's original VSync setting is respected.
 
+When the game is moved to another Space or alt-tabbed, the limiter drops to `FRAME_LIMIT_BG_FPS` (default 10) and stops suppressing App Nap, then restores the foreground cap when you switch back.
+
 ## Building
 
 To build the library:
@@ -77,6 +79,11 @@ echo 30 > ~/.framelimiter.fps
 # Show/hide Metal HUD
 echo 0 > ~/.framelimiter.hud  # Hide
 echo 1 > ~/.framelimiter.hud  # Show
+
+# Background cap applied while the game is occluded / on another Space (requires game restart;
+# read once at launch). 0 disables background throttling.
+echo 10 > ~/.framelimiter.bgfps   # Cap to 10 fps when not visible (default)
+echo 0  > ~/.framelimiter.bgfps   # Don't throttle when backgrounded
 ```
 
 ### Hotkeys via Hammerspoon
@@ -105,6 +112,7 @@ Configure behavior by setting these before launching:
 | `FRAME_LIMIT_FPS` | *unset* | Target FPS. Unset or `0` disables the limiter. |
 | `FRAME_LIMIT_FILE` | `$TMPDIR/framelimiter.fps` | Control file to watch for runtime changes. |
 | `FRAME_LIMIT_REFRESH` | `60` | Screen refresh rate (Hz) for VSync switching. |
+| `FRAME_LIMIT_BG_FPS` | `10` | FPS cap applied while the game is occluded / on another Space / not the active app. `0` disables background throttling entirely. While backgrounded the limiter also releases its App Nap assertion so macOS can throttle the process. |
 | `FRAME_LIMIT_LOG` | `0` | `1` to log periodic FPS; `2` for per-frame timing details. |
 | `FRAME_LIMIT_SIGNALS` | `0` | Set `1` to enable `SIGUSR1`/`SIGUSR2` target stepping (+/- 5 fps). |
 | `FRAME_LIMIT_QOS` | `1` | Forces user-interactive QoS on the render thread. |

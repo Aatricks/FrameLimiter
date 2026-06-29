@@ -10,14 +10,17 @@ int main(int argc, char *argv[]) {
     char fps_file[PATH_MAX];
     char log_file[PATH_MAX];
     char hud_file[PATH_MAX];
+    char bgfps_file[PATH_MAX];
     if (home) {
         snprintf(fps_file, sizeof(fps_file), "%s/.framelimiter.fps", home);
         snprintf(log_file, sizeof(log_file), "%s/.framelimiter.log", home);
         snprintf(hud_file, sizeof(hud_file), "%s/.framelimiter.hud", home);
+        snprintf(bgfps_file, sizeof(bgfps_file), "%s/.framelimiter.bgfps", home);
     } else {
         snprintf(fps_file, sizeof(fps_file), "/tmp/.framelimiter.fps");
         snprintf(log_file, sizeof(log_file), "/tmp/.framelimiter.log");
         snprintf(hud_file, sizeof(hud_file), "/tmp/.framelimiter.hud");
+        snprintf(bgfps_file, sizeof(bgfps_file), "/tmp/.framelimiter.bgfps");
     }
 
     const char *hud_val = "1";
@@ -30,11 +33,25 @@ int main(int argc, char *argv[]) {
         fclose(hf);
     }
 
+    // Background-occlusion fps cap. Read once at launch from ~/.framelimiter.bgfps
+    // (an integer >= 0; 0 disables the background throttle). Defaults to 10.
+    char bgfps_val[16];
+    strlcpy(bgfps_val, "10", sizeof(bgfps_val));
+    FILE *bf = fopen(bgfps_file, "r");
+    if (bf) {
+        int v = -1;
+        if (fscanf(bf, "%d", &v) == 1 && v >= 0) {
+            snprintf(bgfps_val, sizeof(bgfps_val), "%d", v);
+        }
+        fclose(bf);
+    }
+
     setenv("DYLD_INSERT_LIBRARIES", DYLIB_PATH, 1);
     setenv("FRAME_LIMIT_FPS", DEFAULT_FPS, 1);
     setenv("FRAME_LIMIT_FILE", fps_file, 1);
     setenv("FRAME_LIMIT_LOGFILE", log_file, 1);
     setenv("FRAME_LIMIT_LOG", "1", 1);
+    setenv("FRAME_LIMIT_BG_FPS", bgfps_val, 1);
     setenv("MTL_HUD_ENABLED", hud_val, 0);
 
     char path[PATH_MAX];

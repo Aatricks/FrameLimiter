@@ -19,6 +19,7 @@
 
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
+#import <AppKit/AppKit.h>
 #import <objc/runtime.h>
 #import <mach/mach_time.h>
 #import <os/log.h>
@@ -41,6 +42,9 @@ static int         g_log        = 0;   // periodic fps logging
 static int         g_qos        = 1;   // pin the render thread to user-interactive QoS
 static int         g_vsync      = -1;  // -1 = auto, 0 = force off, 1 = force on; see FRAME_LIMIT_VSYNC
 static char        g_ctrl_path[1024];
+static atomic_int  g_background  = 0;   // 1 while the app is occluded / not the active app
+static int         g_bg_fps      = 10;  // cap applied while backgrounded; <= 0 disables the whole feature
+static int         g_nap_suppression = 0; // 1 if we hold an App Nap assertion in the foreground
 
 static mach_timebase_info_data_t g_tb;
 static IMP g_orig_next_drawable = NULL;
@@ -282,7 +286,9 @@ static id hooked_next_drawable(id self, SEL _cmd) {
         pthread_mutex_unlock(&g_census_mutex);
     }
 
-    int target = atomic_load_explicit(&g_target_fps, memory_order_relaxed);
+    int fg_target = atomic_load_explicit(&g_target_fps, memory_order_relaxed);
+    int target = (g_bg_fps > 0 && atomic_load_explicit(&g_background, memory_order_relaxed))
+                 ? g_bg_fps : fg_target;
     int refresh = atomic_load_explicit(&g_refresh, memory_order_relaxed);
     int desired = orig_vsync;
     if (g_vsync == 0) {
@@ -367,6 +373,77 @@ static void *watcher_main(void *arg) {
     return NULL;
 }
 
+// ---- Occlusion / background-state detection ----
+// While the game is on another Space, hidden, or not the active app, we (a) cap to a
+// low background fps and (b) drop the App Nap assertion so macOS can throttle the
+// process. These observers run on the main queue; the hook only reads g_background.
+static BOOL g_obs_app_active  = YES;
+static BOOL g_obs_win_visible = YES;
+static id   g_obs_tokens[3]   = { nil, nil, nil };
+
+static BOOL any_window_visible(void) {
+    NSArray *wins = [NSApp windows];
+    if (wins.count == 0) return YES;  // no windows yet: assume visible (don't false-background)
+    for (NSWindow *w in wins) {
+        if ([w occlusionState] & NSWindowOcclusionStateVisible) return YES;
+    }
+    return NO;
+}
+
+// Recompute background state from the two signals and, on a transition, toggle the
+// App Nap assertion. Called only on the main queue, so g_activity needs no lock.
+static void apply_background_state(void) {
+    BOOL bg  = (!g_obs_app_active) || (!g_obs_win_visible);
+    int  was = atomic_load_explicit(&g_background, memory_order_relaxed);
+    atomic_store_explicit(&g_background, bg ? 1 : 0, memory_order_relaxed);
+    if ((bg ? 1 : 0) == was) return;  // no transition
+
+    if (g_nap_suppression) {
+        if (bg) {
+            if (g_activity) {
+                [[NSProcessInfo processInfo] endActivity:g_activity];
+                [g_activity release];
+                g_activity = nil;
+            }
+        } else if (!g_activity) {
+            g_activity = [[[NSProcessInfo processInfo]
+                beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical)
+                                  reason:@"frame_limiter pacing"] retain];
+        }
+    }
+    log_line("background=%d (app_active=%d win_visible=%d bg_fps=%d)",
+             bg, g_obs_app_active, g_obs_win_visible, g_bg_fps);
+}
+
+static void install_occlusion_observers(void) {
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    NSOperationQueue *mq = [NSOperationQueue mainQueue];
+
+    g_obs_app_active  = [NSApp isActive] ? YES : NO;
+    g_obs_win_visible = any_window_visible();
+    atomic_store_explicit(&g_background,
+        ((!g_obs_app_active) || (!g_obs_win_visible)) ? 1 : 0, memory_order_relaxed);
+
+    id t1 = [nc addObserverForName:NSApplicationDidResignActiveNotification
+                            object:nil queue:mq usingBlock:^(NSNotification *n) {
+        (void)n; g_obs_app_active = NO; apply_background_state();
+    }];
+    id t2 = [nc addObserverForName:NSApplicationDidBecomeActiveNotification
+                            object:nil queue:mq usingBlock:^(NSNotification *n) {
+        (void)n; g_obs_app_active = YES; apply_background_state();
+    }];
+    id t3 = [nc addObserverForName:NSWindowDidChangeOcclusionStateNotification
+                            object:nil queue:mq usingBlock:^(NSNotification *n) {
+        (void)n; g_obs_win_visible = any_window_visible(); apply_background_state();
+    }];
+    g_obs_tokens[0] = [t1 retain];
+    g_obs_tokens[1] = [t2 retain];
+    g_obs_tokens[2] = [t3 retain];
+
+    log_line("occlusion observers installed (bg_fps=%d app_active=%d win_visible=%d)",
+             g_bg_fps, g_obs_app_active, g_obs_win_visible);
+}
+
 __attribute__((constructor))
 static void framelimiter_init(void) {
     const char *lf = getenv("FRAME_LIMIT_LOGFILE");
@@ -383,6 +460,7 @@ static void framelimiter_init(void) {
         atomic_store(&g_refresh, atoi(getenv("FRAME_LIMIT_REFRESH")));
     if (getenv("FRAME_LIMIT_VSYNC"))
         g_vsync = atoi(getenv("FRAME_LIMIT_VSYNC"));
+    if (getenv("FRAME_LIMIT_BG_FPS")) g_bg_fps = atoi(getenv("FRAME_LIMIT_BG_FPS"));
 
     const char *cf = getenv("FRAME_LIMIT_FILE");
     if (cf) {
@@ -404,6 +482,7 @@ static void framelimiter_init(void) {
     // Keep the host out of App Nap and prevent timer coalescing so mach_wait_until
     // isn't throttled. LatencyCritical ensures high-precision timing for pacing.
     if (!getenv("FRAME_LIMIT_NONAP") || atoi(getenv("FRAME_LIMIT_NONAP")) != 0) {
+        g_nap_suppression = 1;
         g_activity = [[[NSProcessInfo processInfo]
             beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical)
                               reason:@"frame_limiter pacing"] retain];
@@ -422,6 +501,12 @@ static void framelimiter_init(void) {
     pthread_t th;
     if (pthread_create(&th, NULL, watcher_main, NULL) == 0)
         pthread_detach(th);
+
+    if (g_bg_fps > 0) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            install_occlusion_observers();
+        });
+    }
 
     log_line("loaded target=%d refresh=%d ctrl=%s log=%d signals=%s",
              target, atomic_load(&g_refresh), g_ctrl_path, g_log,
