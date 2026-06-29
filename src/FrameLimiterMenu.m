@@ -234,10 +234,13 @@
     [self.gamesMenu addItem:rescanItem];
 }
 
-// Is the limiter wrapper installed in this bundle? Detected by the same marker the
-// installer uses. Memory-mapped + prefix-scanned + pooled: game executables can be
-// hundreds of MB, and this runs once per game every time the Games menu opens, so we
-// must not load whole binaries into resident RAM on the main thread.
+// Is the limiter wrapper installed in this bundle? Our wrapper is tiny (tens of KB); a
+// real game binary is multi-MB. So: skip anything large outright (cheap, no read), then
+// check the small candidates for the lowercase 'framelimiter' token that EVERY wrapper
+// version embeds (they all reference the ~/.framelimiter control files). This matches
+// install-lsenv.sh's is_wrapper exactly — so older markerless wrappers are recognised
+// too (a marker-only check showed installed games as un-installed) — and never pages a
+// huge game binary through memory on the main thread.
 - (BOOL)isWrapperInstalledAt:(NSString *)appPath {
     @autoreleasepool {
         NSString *plistPath = [appPath stringByAppendingPathComponent:@"Contents/Info.plist"];
@@ -246,16 +249,14 @@
         if (!exeName) return NO;
         NSString *exePath = [[appPath stringByAppendingPathComponent:@"Contents/MacOS"]
                              stringByAppendingPathComponent:exeName];
-        NSData *exeData = [NSData dataWithContentsOfFile:exePath
-                                                 options:NSDataReadingMappedIfSafe
-                                                   error:nil];
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:exePath error:nil];
+        if (!attrs) return NO;
+        unsigned long long sz = [attrs fileSize];
+        if (sz == 0 || sz > (2ULL << 20)) return NO;   // > 2 MB ⇒ a real game binary, not our wrapper
+        NSData *exeData = [NSData dataWithContentsOfFile:exePath options:NSDataReadingMappedIfSafe error:nil];
         if (!exeData) return NO;
-        NSData *marker = [@"FRAMELIMITER_WRAPPER_v1" dataUsingEncoding:NSASCIIStringEncoding];
-        // The wrapper is tiny (~100 KB), so the marker is always near the start; cap the
-        // scan so a 100 MB+ real game binary isn't paged through in full to find nothing.
-        NSUInteger scanLen = MIN(exeData.length, (NSUInteger)(2u << 20));  // 2 MB
-        NSRange r = [exeData rangeOfData:marker options:0 range:NSMakeRange(0, scanLen)];
-        return r.location != NSNotFound;
+        NSData *needle = [@"framelimiter" dataUsingEncoding:NSASCIIStringEncoding];
+        return [exeData rangeOfData:needle options:0 range:NSMakeRange(0, exeData.length)].location != NSNotFound;
     }
 }
 
