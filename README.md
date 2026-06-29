@@ -30,77 +30,72 @@ This compiles:
 
 ## Usage
 
-### 1. Steam & Native Games (Wrapper Binary Method)
-Steam on macOS cannot pass environment variables through launch options, and using `%command%` wrapper scripts fails with an OS execution error (Valve issue #5548).
-
-To get around this, the `install-lsenv.sh` script replaces the game's executable with a compiled C wrapper that sets the required environment variables before launching the real game (renamed to `Executable.real`). 
-
-By compiling a binary wrapper and copying the original game's entitlements, macOS still recognizes the app identity, ensuring **Game Mode** and fullscreen compositor bypass optimizations remain active.
+### Menu-bar app (recommended)
 
 ```bash
-# Install (replaces the game executable with the C wrapper; defaults to 80 fps if FPS is omitted)
-./scripts/install-lsenv.sh install "/path/to/Game.app" 80
-
-# Uninstall (restores the original executable and plist backups)
-./scripts/install-lsenv.sh uninstall "/path/to/Game.app"
-
-# Status (shows whether a game is injected)
-./scripts/install-lsenv.sh status "/path/to/Game.app"
-
-# CLI tool setup (symlinks flctl into ~/.local/bin)
-./scripts/install-lsenv.sh cli
-
-# Clean (removes the shared dylib, all control files, and the flctl symlink)
-./scripts/install-lsenv.sh clean
+make build
+make install-app        # build/FrameLimiter.app -> /Applications, registered with Launch Services
 ```
 
-*Note: Game updates through Steam or the App Store will overwrite the wrapper executable. You will need to re-run the install script after any game update. This is SAFE to re-run: it detects whether the on-disk binary is the wrapper or a fresh game binary and never clobbers the real binary. A failed install rolls back to a launchable executable.*
+Open FrameLimiter from the menu bar (or Spotlight). Use the **Games** menu to install/uninstall the limiter on a game — Steam games are auto-detected, or **Add game…** for anything else. Then launch the game from Steam: the app opens on its own, shows the live fps, lets you change the cap / background cap / Metal HUD, and quits when the game exits.
 
-*The dylib is published to a STABLE path (`~/.framelimiter/frame_limiter.dylib`) baked into the wrapper, so moving, rebuilding, or deleting this repo no longer orphans an installed game. Per-app uninstall only reverts that bundle; control files and the shared dylib persist (other installed games keep working) until you run the `clean` command.*
+- HUD and background-cap changes apply on the next launch.
+- Re-run install after a game update. It's safe to re-run — it never touches the real game binary, and a failed install rolls back to a launchable state.
 
-### 2. Standalone Games (Direct Command Line)
-For standalone apps launched outside of Steam, you can run them directly from the terminal with the environment variables pre-set:
+### CLI install (alternative)
+
+`install-lsenv.sh` does the same install the Games menu does:
 
 ```bash
-DYLD_INSERT_LIBRARIES=/Users/aatricks/Documents/Dev/FrameLimiter/build/frame_limiter.dylib \
+./scripts/install-lsenv.sh install "/path/to/Game.app" 80   # install (default 80 fps)
+./scripts/install-lsenv.sh uninstall "/path/to/Game.app"    # revert to original
+./scripts/install-lsenv.sh status "/path/to/Game.app"       # show state
+./scripts/install-lsenv.sh cli                              # symlink flctl into ~/.local/bin
+./scripts/install-lsenv.sh clean                            # remove the dylib + control files
+```
+
+It swaps the game's executable for a small C wrapper that sets the env vars and execs the real binary (renamed `Executable.real`), copying the game's entitlements so Game Mode and the fullscreen path keep working. (Steam can't pass env vars through launch options, and `%command%` scripts fail — Valve #5548.) The dylib lives at `~/.framelimiter/frame_limiter.dylib` and that path is baked into the wrapper, so moving or rebuilding the repo won't break installed games. `uninstall` reverts one bundle; `clean` removes the shared dylib and control files.
+
+### Standalone (no Steam)
+
+```bash
+DYLD_INSERT_LIBRARIES=$PWD/build/frame_limiter.dylib \
 FRAME_LIMIT_FILE=$HOME/.framelimiter.fps \
 FRAME_LIMIT_FPS=80 \
 "/path/to/Game.app/Contents/MacOS/Game"
 ```
 
-## Runtime Tuning
+## Runtime tuning
 
-The frame rate cap can be changed instantly **on the fly** without restarting the game. However, toggling the Metal HUD requires **restarting the game**, as macOS only checks the HUD environment variable at startup.
+The cap changes live, no restart. HUD and background-cap changes apply on the next launch. Change everything from the menu-bar app, or use `flctl` for hotkeys and scripting.
 
-Use the `flctl` tool to control these settings:
+### flctl (hotkeys & scripting)
+
+CLI front-end over the same `~/.framelimiter.*` control files. Bind it to a global hotkey to change the cap mid-game, or call it from scripts. Put it on PATH with `./scripts/install-lsenv.sh cli`, then:
 
 ```bash
-./scripts/flctl 30          # Cap to 30 fps (takes effect immediately, clamped to 1000)
-./scripts/flctl off         # Disable the cap (takes effect immediately)
-./scripts/flctl on          # Restore the last active cap (takes effect immediately)
-./scripts/flctl toggle      # Toggle the cap on/off (takes effect immediately)
-./scripts/flctl hud off     # Hide the Metal HUD overlay (requires game restart)
-./scripts/flctl hud on      # Show the Metal HUD overlay (requires game restart)
-./scripts/flctl hud         # Show current HUD status
-./scripts/flctl bgfps 10    # Cap to 10 fps when not visible (requires game restart)
-./scripts/flctl bgfps off   # Don't throttle when backgrounded
-./scripts/flctl bgfps       # Show current background fps cap
-./scripts/flctl status      # Show attach-aware status (whether game is injected and live fps)
-./scripts/flctl -h          # Show help message
+flctl 30          # Cap to 30 fps (takes effect immediately, clamped to 1000)
+flctl off         # Disable the cap (takes effect immediately)
+flctl on          # Restore the last active cap (takes effect immediately)
+flctl toggle      # Toggle the cap on/off (takes effect immediately)
+flctl hud off     # Hide the Metal HUD overlay (requires game restart)
+flctl hud on      # Show the Metal HUD overlay (requires game restart)
+flctl hud         # Show current HUD status
+flctl bgfps 10    # Cap to 10 fps when not visible (requires game restart)
+flctl bgfps off   # Don't throttle when backgrounded
+flctl bgfps       # Show current background fps cap
+flctl status      # Show attach-aware status (whether a game is injected and live fps)
+flctl -h          # Show help
 ```
 
-### Menu-bar app
-A lightweight macOS menu-bar agent (no Dock icon) that shows the live measured fps of the active game.
-Use it to pick a frame cap, set the background cap, toggle the Metal HUD, open the log, and manage games — all via the same control files that `flctl` uses.
+Bind the verbs to system-wide shortcuts — e.g. in Hammerspoon:
 
-**Install it** (self-contained — bundles its own copy of `install-lsenv.sh` + the dylib, so it works from anywhere):
-```bash
-make install-app          # copies build/FrameLimiter.app -> /Applications and registers it
+```lua
+local fl = "/Users/aatricks/Documents/Dev/FrameLimiter/scripts/flctl"
+hs.hotkey.bind({"cmd","alt"}, "L", function() hs.execute(fl.." toggle", true) end)
+hs.hotkey.bind({"cmd","alt"}, "[", function() hs.execute(fl.." 30", true) end)
+hs.hotkey.bind({"cmd","alt"}, "]", function() hs.execute(fl.." 80", true) end)
 ```
-
-- **Auto-launch + self-quit (ephemeral):** once installed, the game wrapper launches the app automatically when you start a wrapped game, and it **self-quits when the game exits** — so you don't have to keep it running. It decides to quit by the game *process* ending (not by the fps heartbeat), so it won't disappear while a game is merely minimized. You can also open it manually anytime (Spotlight / `open -b com.framelimiter.menu`); a manually-opened instance stays until you quit it. *(Re-run `install` on your games once to pick up the auto-launching wrapper.)*
-- **Games submenu:** discover and manage games without the terminal. It auto-detects Steam games (scanning `steamapps/common` across all library folders) and lets you **"Add game…"** for anything else (remembered across launches). A checkmark shows which games have the limiter installed; clicking a game **installs or uninstalls** it. Quit the game first — the app prompts if it's still running.
-- Note: HUD and background-cap changes only take effect on the next game launch.
 
 ### Control files
 The limiter state is managed via the following control files. `flctl`, the menu-bar app, and the wrapper binary all interact with these:
@@ -113,16 +108,6 @@ The limiter state is managed via the following control files. `flctl`, the menu-
 | `~/.framelimiter.bgfps` | Background/occluded FPS cap; read at launch, applies on the **next launch**. |
 | `~/.framelimiter.status` | **Read-only heartbeat** written ~1x/second by the dylib; contains key=value lines (`pid`, `target`, `fg_target`, `measured_fps`, `background`, `bg_fps`, `refresh`, `vsync_mode`, `ts`). A reader treats the limiter as live when `ts` is within ~3 s of now. |
 | `~/.framelimiter.log` | Appended log output (tail it, or use: `log stream --predicate 'eventMessage CONTAINS "framelimiter"'`). |
-
-### Hotkeys via Hammerspoon
-You can bind `flctl` to system-wide shortcuts. For example, in Hammerspoon:
-
-```lua
-local fl = "/Users/aatricks/Documents/Dev/FrameLimiter/scripts/flctl"
-hs.hotkey.bind({"cmd","alt"}, "L", function() hs.execute(fl.." toggle", true) end)
-hs.hotkey.bind({"cmd","alt"}, "[", function() hs.execute(fl.." 30", true) end)
-hs.hotkey.bind({"cmd","alt"}, "]", function() hs.execute(fl.." 80", true) end)
-```
 
 ## Recommended Targets (60Hz Displays)
 
