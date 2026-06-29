@@ -48,6 +48,16 @@ cat <<EOF > "$APPDIR/Contents/Info.plist"
 </plist>
 EOF
 
+# Bundle the install machinery so the app is self-contained (works from /Applications).
+# install-lsenv.sh resolves wrapper.c + the dylib relative to itself, and flctl sits
+# alongside it — mirroring the repo's scripts/ layout, so no code change is needed.
+mkdir -p "$APPDIR/Contents/Resources"
+cp scripts/install-lsenv.sh  "$APPDIR/Contents/Resources/install-lsenv.sh"
+cp scripts/flctl             "$APPDIR/Contents/Resources/flctl"
+cp src/wrapper.c             "$APPDIR/Contents/Resources/wrapper.c"
+cp build/frame_limiter.dylib "$APPDIR/Contents/Resources/frame_limiter.dylib"
+chmod +x "$APPDIR/Contents/Resources/install-lsenv.sh" "$APPDIR/Contents/Resources/flctl"
+
 codesign --force --sign - "$APPDIR"
 
 echo "built:"

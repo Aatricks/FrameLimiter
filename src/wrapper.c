@@ -53,11 +53,24 @@ int main(int argc, char *argv[]) {
         fclose(bf);
     }
 
-    // Tag the main game process so the dylib's child-process guard can recognise it.
-    // The pid survives execv, so this equals the game's pid; children the game spawns
-    // get fresh pids and the dylib stays inert in them.
+    // Best-effort: bring up the menu-bar app in ephemeral mode, handing it OUR pid. After
+    // execv this process becomes the game (pid preserved), so the app can watch this exact
+    // pid and quit precisely when the game exits — independent of render/heartbeat timing,
+    // so a slow first frame (shader compile, cold start) can't make it quit mid-load.
+    // Launch by bundle id (no path baked in) BEFORE exporting DYLD_INSERT_LIBRARIES so
+    // neither `open` nor the app inherits the injection. Failure is ignored.
+    int mypid = (int)getpid();
     char owner_pid[16];
-    snprintf(owner_pid, sizeof(owner_pid), "%d", (int)getpid());
+    snprintf(owner_pid, sizeof(owner_pid), "%d", mypid);
+
+    char open_cmd[160];
+    snprintf(open_cmd, sizeof(open_cmd),
+             "open -g -b com.framelimiter.menu --args --auto --gamepid %d >/dev/null 2>&1", mypid);
+    int rc_open = system(open_cmd);
+    (void)rc_open;
+
+    // Tag the main game process so the dylib's child-process guard can recognise it
+    // (children the game spawns get fresh pids and the dylib stays inert in them).
     setenv("FRAME_LIMIT_OWNER_PID", owner_pid, 1);
 
     setenv("DYLD_INSERT_LIBRARIES", DYLIB_PATH, 1);

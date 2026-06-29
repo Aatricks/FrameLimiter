@@ -90,11 +90,17 @@ Use the `flctl` tool to control these settings:
 ```
 
 ### Menu-bar app
-The repository builds a lightweight macOS menu-bar agent (no Dock icon) that shows the live measured fps of the active game. 
-You can use it to pick a frame cap, set the background cap, toggle the Metal HUD, and open the log — all via the same control files that `flctl` uses.
-- Launch with `open build/FrameLimiter.app` (or add it to your Login Items).
-- Note: HUD and background-cap changes applied through the menu-bar app only take effect on the next game launch.
-- **Games submenu**: discover and manage games without the terminal. It auto-detects Steam games (scanning `steamapps/common` across all library folders) and lets you **"Add game…"** for anything else (remembered across launches). A checkmark shows which games have the limiter installed; clicking a game **installs or uninstalls** it (it shells out to `install-lsenv.sh`, so it's the same safe operation). Quit the game first — the app will prompt if it's still running. Requires running the app from the repo's `build/` (it locates `install-lsenv.sh` and the dylib relative to itself).
+A lightweight macOS menu-bar agent (no Dock icon) that shows the live measured fps of the active game.
+Use it to pick a frame cap, set the background cap, toggle the Metal HUD, open the log, and manage games — all via the same control files that `flctl` uses.
+
+**Install it** (self-contained — bundles its own copy of `install-lsenv.sh` + the dylib, so it works from anywhere):
+```bash
+make install-app          # copies build/FrameLimiter.app -> /Applications and registers it
+```
+
+- **Auto-launch + self-quit (ephemeral):** once installed, the game wrapper launches the app automatically when you start a wrapped game, and it **self-quits when the game exits** — so you don't have to keep it running. It decides to quit by the game *process* ending (not by the fps heartbeat), so it won't disappear while a game is merely minimized. You can also open it manually anytime (Spotlight / `open -b com.framelimiter.menu`); a manually-opened instance stays until you quit it. *(Re-run `install` on your games once to pick up the auto-launching wrapper.)*
+- **Games submenu:** discover and manage games without the terminal. It auto-detects Steam games (scanning `steamapps/common` across all library folders) and lets you **"Add game…"** for anything else (remembered across launches). A checkmark shows which games have the limiter installed; clicking a game **installs or uninstalls** it. Quit the game first — the app prompts if it's still running.
+- Note: HUD and background-cap changes only take effect on the next game launch.
 
 ### Control files
 The limiter state is managed via the following control files. `flctl`, the menu-bar app, and the wrapper binary all interact with these:

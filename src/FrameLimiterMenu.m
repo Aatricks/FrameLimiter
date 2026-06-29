@@ -1,4 +1,6 @@
 #import <Cocoa/Cocoa.h>
+#include <signal.h>
+#include <errno.h>
 
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
 @property (strong) NSStatusItem *statusItem;
@@ -13,11 +15,27 @@
 @property (strong) NSArray *bgFpsItems;
 @property (strong) NSMenuItem *hudItem;
 @property (strong) NSMenu *gamesMenu;
+
+@property (assign) BOOL ephemeral;     // launched with --auto by the game wrapper
+@property (assign) int  autoGamePid;   // game pid handed over via --gamepid (-1 if none)
+@property (assign) int  lastGamePid;   // pid of the most recently observed live game
+@property (assign) BOOL sawGame;       // a live game has appeared since launch
+@property (assign) int  idleTicks;     // consecutive 1s ticks with no live game
 @end
 
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
+    // The game wrapper launches us with `--auto --gamepid <pid>`; in that mode we self-quit
+    // when that game process exits. A manual launch (no --auto) stays open for game setup.
+    NSArray *launchArgs = [[NSProcessInfo processInfo] arguments];
+    self.ephemeral = [launchArgs containsObject:@"--auto"];
+    self.autoGamePid = -1;
+    NSUInteger gpi = [launchArgs indexOfObject:@"--gamepid"];
+    if (gpi != NSNotFound && gpi + 1 < launchArgs.count) {
+        self.autoGamePid = [launchArgs[gpi + 1] intValue];
+    }
+
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
     self.statusItem.button.title = @"–";
     
@@ -111,17 +129,26 @@
     }
 }
 
+// Path to the install-lsenv.sh that drives install/uninstall. Prefer the copy bundled in
+// the app (self-contained — works from /Applications); fall back to the repo's scripts/
+// for a dev build run out of build/. The script resolves the dylib + wrapper source
+// relative to itself, so either location works. nil = neither found.
+- (NSString *)installScriptPath {
+    NSString *bundled = [[NSBundle mainBundle] pathForResource:@"install-lsenv" ofType:@"sh"];
+    if (bundled && [[NSFileManager defaultManager] isReadableFileAtPath:bundled]) return bundled;
+    NSString *repo = [[[[NSBundle mainBundle] bundlePath]
+                       stringByAppendingPathComponent:@"../.."] stringByStandardizingPath];
+    NSString *repoScript = [repo stringByAppendingPathComponent:@"scripts/install-lsenv.sh"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:repoScript]) return repoScript;
+    return nil;
+}
+
 - (void)rebuildGamesMenu {
     [self.gamesMenu removeAllItems];
-    
-    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
-    NSString *repoPath = [[bundlePath stringByAppendingPathComponent:@"../.."] stringByStandardizingPath];
-    NSString *scriptPath = [repoPath stringByAppendingPathComponent:@"scripts/install-lsenv.sh"];
-    NSString *dylibPath = [repoPath stringByAppendingPathComponent:@"build/frame_limiter.dylib"];
-    
+
     NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:scriptPath] || ![fm fileExistsAtPath:dylibPath]) {
-        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@"Install unavailable — run from the repo's build/" action:nil keyEquivalent:@""];
+    if (![self installScriptPath]) {
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:@"Install unavailable — run 'make install-app'" action:nil keyEquivalent:@""];
         [item setEnabled:NO];
         [self.gamesMenu addItem:item];
         return;
@@ -271,11 +298,10 @@
 - (void)toggleGameInstall:(NSMenuItem *)sender {
     NSString *appPath = sender.representedObject;
     BOOL isInstalled = (sender.state == NSControlStateValueOn);
-    
-    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
-    NSString *repoPath = [[bundlePath stringByAppendingPathComponent:@"../.."] stringByStandardizingPath];
-    NSString *scriptPath = [repoPath stringByAppendingPathComponent:@"scripts/install-lsenv.sh"];
-    
+
+    NSString *scriptPath = [self installScriptPath];
+    if (!scriptPath) return;
+
     for (NSRunningApplication *app in [[NSWorkspace sharedWorkspace] runningApplications]) {
         NSString *runningPath = app.bundleURL.path;
         if (runningPath && ([runningPath isEqualToString:appPath] ||
@@ -516,8 +542,35 @@
         self.infoItem1.title = @"No game running";
         self.infoItem2.hidden = YES;
     }
-    
+
     [self refreshMenuStates];
+
+    // Ephemeral mode: quit once the game has actually exited. We track process liveness
+    // (kill(pid,0) == ESRCH), NOT heartbeat freshness — many games stop rendering while
+    // backgrounded, and a slow first frame means no heartbeat during load either.
+    if (self.ephemeral) {
+        if (self.autoGamePid > 0) {
+            // Authoritative: the wrapper handed us the game's pid, so wait exactly as long
+            // as that process lives — load time and render activity are irrelevant.
+            if (kill(self.autoGamePid, 0) != 0 && errno == ESRCH) {
+                [NSApp terminate:nil];
+            }
+        } else if (isLive) {
+            // Fallback (no --gamepid): learn the pid from the heartbeat.
+            self.sawGame = YES;
+            self.lastGamePid = pid;
+            self.idleTicks = 0;
+        } else {
+            self.idleTicks++;
+            BOOL gone = (self.lastGamePid > 0) &&
+                        (kill(self.lastGamePid, 0) != 0 && errno == ESRCH);
+            if (self.sawGame && gone) {
+                [NSApp terminate:nil];
+            } else if (!self.sawGame && self.idleTicks > 30) {
+                [NSApp terminate:nil];   // launched --auto but no game ever appeared
+            }
+        }
+    }
 }
 
 @end

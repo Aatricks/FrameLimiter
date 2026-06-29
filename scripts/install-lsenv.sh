@@ -25,8 +25,19 @@ set -euo pipefail
 
 MODE="${1:-}"
 
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
-DYLIB="$DIR/build/frame_limiter.dylib"
+# Resolve the wrapper source, dylib, and flctl for BOTH layouts: the repo (this script in
+# scripts/, sources in ../src and ../build) and a self-contained app bundle (this script
+# copied into Contents/Resources/ alongside the same files). flctl sits next to this
+# script in both layouts.
+SELF="$(cd "$(dirname "$0")" && pwd)"
+FLCTL="$SELF/flctl"
+if [ -f "$SELF/../src/wrapper.c" ]; then
+  WRAPPER_SRC="$SELF/../src/wrapper.c"; DYLIB="$SELF/../build/frame_limiter.dylib"
+elif [ -f "$SELF/wrapper.c" ]; then
+  WRAPPER_SRC="$SELF/wrapper.c";        DYLIB="$SELF/frame_limiter.dylib"
+else
+  WRAPPER_SRC="$SELF/../src/wrapper.c"; DYLIB="$SELF/../build/frame_limiter.dylib"
+fi
 STABLE_HOME="$HOME/.framelimiter"
 STABLE_DYLIB="$STABLE_HOME/frame_limiter.dylib"
 STATE="$STABLE_HOME/backups"
@@ -35,13 +46,18 @@ PB=/usr/libexec/PlistBuddy
 LSREG=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
 MARKER="FRAMELIMITER_WRAPPER_v1"
 
-is_wrapper() { grep -aq "$MARKER" "$1" 2>/dev/null; }
+# Detect ANY FrameLimiter wrapper — current builds AND older pre-marker ones. Every
+# wrapper references the ~/.framelimiter control files, so this lowercase token is a
+# reliable cross-version signal; a real game binary won't contain it. Using only the
+# explicit MARKER here was a destructive bug: an older markerless wrapper was misread as
+# a real game binary, and its .real (the actual game) got moved/deleted.
+is_wrapper() { grep -aiq 'framelimiter' "$1" 2>/dev/null; }
 
 # ---- modes that take no app bundle ----
 case "$MODE" in
   cli)
     mkdir -p "$HOME/.local/bin"
-    ln -sf "$DIR/scripts/flctl" "$HOME/.local/bin/flctl"
+    ln -sf "$FLCTL" "$HOME/.local/bin/flctl"
     echo "linked flctl -> $HOME/.local/bin/flctl"
     case ":$PATH:" in
       *":$HOME/.local/bin:"*) ;;
@@ -134,7 +150,7 @@ case "$MODE" in
     clang -O2 -Wall -arch "$(uname -m)" \
       -DDYLIB_PATH="\"$STABLE_DYLIB\"" \
       -DDEFAULT_FPS="\"$FPS\"" \
-      -o "$EXE_PATH" "$DIR/src/wrapper.c"
+      -o "$EXE_PATH" "$WRAPPER_SRC"
     WROTE_WRAPPER=1
 
     # Replicate the real binary's entitlements onto the wrapper, then re-seal the bundle.
